@@ -419,9 +419,16 @@ public sealed class MediaSourceManagerDecorator(
         {
             foreach (var src in ordered)
             {
-                src.Path = "/stub";
-                src.IsRemote = false;
-                src.Protocol = MediaProtocol.File;
+                // Only stub sources that have a real path to back them up.
+                // Leaving placeholder sources (null path) unstubbed prevents
+                // Jellyfin from treating them as File-protocol streams and
+                // passing an empty string to FFmpeg.
+                if (!string.IsNullOrEmpty(src.Path))
+                {
+                    src.Path = "/stub";
+                    src.IsRemote = false;
+                    src.Protocol = MediaProtocol.File;
+                }
             }
         }
 
@@ -443,9 +450,15 @@ public sealed class MediaSourceManagerDecorator(
                 ) ?? list.FirstOrDefault();
         }
 
+        // Only probe sources that have a real streamable path.
+        // A null/empty path means the source is a placeholder (no streams loaded yet);
+        // probing it passes an empty string to FFmpeg which exits with code 254.
         static bool NeedsProbe(MediaSourceInfo s) =>
-            (s.MediaStreams?.All(ms => ms.Type != MediaStreamType.Video) ?? true)
-            || (s.RunTimeTicks ?? 0) < TimeSpan.FromMinutes(2).Ticks;
+            !string.IsNullOrEmpty(s.Path)
+            && (
+                (s.MediaStreams?.All(ms => ms.Type != MediaStreamType.Video) ?? true)
+                || (s.RunTimeTicks ?? 0) < TimeSpan.FromMinutes(2).Ticks
+            );
 
         BaseItem ResolveOwnerFor(MediaSourceInfo s, BaseItem fallback) =>
             Guid.TryParse(s.ETag, out var g) ? libraryManager.GetItemById(g) ?? fallback : fallback;
