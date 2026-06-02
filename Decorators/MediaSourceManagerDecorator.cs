@@ -355,23 +355,7 @@ public sealed class MediaSourceManagerDecorator(
             mediaSourceId
         );
 
-        // No specific source was requested — return the full list so the client
-        // can display a version picker. Stub paths on POST requests to prevent
-        // the client from direct-playing a raw Stremio URL before a source is chosen.
-        if (mediaSourceId is null)
-        {
-            if (ctx?.GetActionName() == "GetPostedPlaybackInfo")
-            {
-                foreach (var src in sources)
-                {
-                    src.Path = "/stub";
-                    src.IsRemote = false;
-                    src.Protocol = MediaProtocol.File;
-                }
-            }
-            return sources;
-        }
-
+        // Identify the preferred source (explicit client choice, or first available).
         var selected = SelectByIdOrFirst(sources, mediaSourceId);
         if (selected is null)
             return sources;
@@ -396,7 +380,6 @@ public sealed class MediaSourceManagerDecorator(
                 ct
             );
             var metadataTask = ProbeStreamAsync((Video)owner, selected.Path, ct);
-            //  var subtitleTask = DownloadSubtitles((Video)owner, ct);
 
             await Task.WhenAll(metadataTask, segmentTask).ConfigureAwait(false);
 
@@ -409,6 +392,8 @@ public sealed class MediaSourceManagerDecorator(
 
             if (selected is null)
                 return refreshed;
+
+            sources = refreshed.ToList();
         }
 
         if (item.RunTimeTicks is null && selected.RunTimeTicks is not null)
@@ -418,16 +403,33 @@ public sealed class MediaSourceManagerDecorator(
                 .ConfigureAwait(false);
         }
 
-        // Stub path after probing is done so the real URL is never sent to clients.
-        // Force File protocol so clients proxy through Jellyfin instead of direct-playing.
-        if (ctx.GetActionName() == "GetPostedPlaybackInfo")
+        // Always return ALL sources so every client can show a version picker,
+        // regardless of whether it already sent a mediaSourceId. This fixes
+        // TV episode playback on clients (e.g. Neptune) that read the first
+        // available sourceId from the episode-list DTO and send it immediately,
+        // which previously caused only one source to come back.
+        //
+        // Put the selected source first (Type=Default); the rest stay Grouping.
+        // Stub ALL paths on POST so clients proxy through Jellyfin's stream
+        // endpoint — the correct source is resolved there via mediaSourceId.
+        var ordered = new List<MediaSourceInfo>(sources.Count) { selected };
+        ordered.AddRange(sources.Where(s => s.Id != selected.Id));
+
+        if (ctx?.GetActionName() == "GetPostedPlaybackInfo")
         {
-            selected.Path = "/stub";
-            selected.IsRemote = false;
-            selected.Protocol = MediaProtocol.File;
+            foreach (var src in ordered)
+            {
+                src.Path = "/stub";
+                src.IsRemote = false;
+                src.Protocol = MediaProtocol.File;
+            }
         }
 
-        return [selected];
+        ordered[0].Type = MediaSourceType.Default;
+        for (var i = 1; i < ordered.Count; i++)
+            ordered[i].Type = MediaSourceType.Grouping;
+
+        return ordered;
 
         static MediaSourceInfo? SelectByIdOrFirst(IReadOnlyList<MediaSourceInfo> list, Guid? id)
         {
