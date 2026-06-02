@@ -27,6 +27,18 @@ public sealed class DtoServiceDecorator(IDtoService inner, Lazy<GelatoManager> m
         BaseItem? owner = null
     )
     {
+        // Force MediaSources to be included for Gelato Movie/Episode items so
+        // that clients which don't explicitly request this field (e.g. Neptune,
+        // Swiftfin) still receive the stream list and can show a version picker.
+        if (
+            item.IsGelato()
+            && item.GetBaseItemKind() is BaseItemKind.Movie or BaseItemKind.Episode
+            && !options.ContainsField(ItemFields.MediaSources)
+        )
+        {
+            options.Fields = [.. options.Fields, ItemFields.MediaSources];
+        }
+
         var dto = inner.GetBaseItemDto(item, options, user, owner);
         Patch(dto, item, _http.HttpContext?.IsApiListing() == true, user);
         return dto;

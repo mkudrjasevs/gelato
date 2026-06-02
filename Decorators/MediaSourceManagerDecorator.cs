@@ -338,24 +338,39 @@ public sealed class MediaSourceManagerDecorator(
 
         var sources = GetStaticMediaSources(item, enablePathSubstitution, user);
 
+        // Only honour a mediaSourceId that was explicitly supplied by the client.
+        // Falling back to sources[0] meant clients that call GetPlaybackInfo
+        // without a mediaSourceId (e.g. Neptune, Swiftfin) to discover available
+        // versions only ever saw one source and had no picker to choose from.
         Guid? mediaSourceId =
             ctx?.Items.TryGetValue("MediaSourceId", out var idObj) == true
             && idObj is string idStr
             && Guid.TryParse(idStr, out var fromCtx)
                 ? fromCtx
-                : (
-                    item.IsPrimaryVersion()
-                    && sources.Count > 0
-                    && Guid.TryParse(sources[0].Id, out var fromSource)
-                        ? fromSource
-                        : null
-                );
+                : null;
 
         _log.LogDebug(
             "GetPlaybackMediaSources {ItemId} mediaSourceId={MediaSourceId}",
             item.Id,
             mediaSourceId
         );
+
+        // No specific source was requested — return the full list so the client
+        // can display a version picker. Stub paths on POST requests to prevent
+        // the client from direct-playing a raw Stremio URL before a source is chosen.
+        if (mediaSourceId is null)
+        {
+            if (ctx?.GetActionName() == "GetPostedPlaybackInfo")
+            {
+                foreach (var src in sources)
+                {
+                    src.Path = "/stub";
+                    src.IsRemote = false;
+                    src.Protocol = MediaProtocol.File;
+                }
+            }
+            return sources;
+        }
 
         var selected = SelectByIdOrFirst(sources, mediaSourceId);
         if (selected is null)
