@@ -72,14 +72,29 @@ public sealed class PurgeGelatoTask(
             .GroupBy(i => i.GetBaseItemKind())
             .ToDictionary(g => g.Key, g => g.Count());
 
-        const int batchSize = 250;
+        // DeleteItemsUnsafeFast batches a bulk UserData tombstone UPDATE which
+        // fails with UNIQUE constraint when two deleted items share the same
+        // UserId+CustomDataKey. Delete one-by-one to avoid this.
         var totalItems = items.Count;
         var processed = 0;
 
-        foreach (var batch in items.Chunk(batchSize))
+        foreach (var item in items)
         {
-            libraryManager.DeleteItemsUnsafeFast(batch);
-            processed += batch.Length;
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                libraryManager.DeleteItem(
+                    item,
+                    new DeleteOptions { DeleteFileLocation = false },
+                    true
+                );
+            }
+            catch (Exception ex)
+            {
+                log.LogWarning(ex, "Failed to delete item {ItemId}", item.Id);
+            }
+
+            processed++;
             progress?.Report((double)processed / totalItems * 100);
         }
 

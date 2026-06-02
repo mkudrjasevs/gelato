@@ -857,10 +857,19 @@ public class StremioStream
 
     public bool IsValid()
     {
+        // Torrent-only streams (InfoHash, no URL) are valid — path is built locally.
+        if (!string.IsNullOrWhiteSpace(InfoHash))
+            return true;
+
         if (string.IsNullOrWhiteSpace(Url))
             return false;
 
         if (!Uri.TryCreate(Url, UriKind.Absolute, out var uri))
+            return false;
+
+        // Reject custom schemes (e.g. gelato://, magnet://) — only HTTP(S) can be streamed.
+        if (!uri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase)
+            && !uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
             return false;
 
         return !(uri.PathAndQuery == "/" || string.IsNullOrEmpty(uri.PathAndQuery));
@@ -868,7 +877,12 @@ public class StremioStream
 
     public bool IsFile()
     {
-        return !string.IsNullOrWhiteSpace(Url);
+        if (string.IsNullOrWhiteSpace(Url))
+            return false;
+
+        return Uri.TryCreate(Url, UriKind.Absolute, out var uri)
+            && (uri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase)
+                || uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase));
     }
 
     public bool IsTorrent()

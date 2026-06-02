@@ -608,7 +608,11 @@ public sealed class GelatoManager(
         stopwatch.Stop();
 
         _log.LogInformation(
-            $"SyncStreams finished GelatoId={uri.ExternalId} userId={userId} duration={Math.Round(stopwatch.Elapsed.TotalSeconds, 1)}s streams={upsertedStreams.Count}"
+            "SyncStreams finished GelatoId={GelatoId} userId={UserId} duration={Duration}s streams={StreamCount}",
+            uri.ExternalId,
+            userId,
+            Math.Round(stopwatch.Elapsed.TotalSeconds, 1),
+            upsertedStreams.Count
         );
 
         return acceptable.Count;
