@@ -182,7 +182,19 @@ public sealed class MediaSourceManagerDecorator(
             libraryManager.GetItemById(item.Id);
         }
 
-        var sources = _inner.GetStaticMediaSources(item, enablePathSubstitution, user).ToList();
+        // Strip sources that carry a non-HTTP scheme path (e.g. "gelato://stub/{id}" or
+        // "stremio://…"). Jellyfin's inner implementation derives those paths directly
+        // from the item's stored Path field, which Gelato sets to a virtual stub URI.
+        // Letting them through causes HttpClient to throw NotSupportedException when
+        // Jellyfin tries to fetch them as remote streams.
+        var sources = _inner
+            .GetStaticMediaSources(item, enablePathSubstitution, user)
+            .Where(k =>
+                string.IsNullOrEmpty(k.Path)
+                || (!k.Path.StartsWith("gelato://", StringComparison.OrdinalIgnoreCase)
+                    && !k.Path.StartsWith("stremio://", StringComparison.OrdinalIgnoreCase))
+            )
+            .ToList();
 
         // we dont use jellyfins alternate versions crap. So we have to load it ourselves
 
@@ -254,9 +266,10 @@ public sealed class MediaSourceManagerDecorator(
 
         sources.AddRange(gelatoSources);
 
-        if (sources.Count > 1)
+        // When streams are present, remove any remaining stub/placeholder sources
+        // (e.g. those derived from the item's own virtual path via inner sources).
+        if (gelatoSources.Count > 0)
         {
-            // remove primary from list when there are streams
             sources = sources
                 .Where(k =>
                     !(k.Path?.StartsWith("gelato", StringComparison.OrdinalIgnoreCase) ?? false)
@@ -267,10 +280,13 @@ public sealed class MediaSourceManagerDecorator(
                 .ToList();
         }
 
-        // failsafe. mediasources cannot be null
+        // Failsafe: always return at least one source. Use a Placeholder (no path)
+        // so Jellyfin shows the item but does not attempt to stream a broken URI.
         if (sources.Count == 0)
         {
-            sources.Add(GetVersionInfo(item, MediaSourceType.Default, user));
+            var placeholder = GetVersionInfo(item, MediaSourceType.Placeholder, user);
+            placeholder.Path = null;
+            sources.Add(placeholder);
         }
 
         if (sources.Count > 0)
