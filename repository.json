@@ -1,3 +1,20 @@
-{
-  "plugins": []
-}
+[
+  {
+    "category": "General",
+    "description": "Stream external media.\n",
+    "guid": "94EA4E14-8163-4989-96FE-0A2094BC2D6A",
+    "name": "Gelato",
+    "overview": "Stream external media.",
+    "owner": "mkudrjasevs",
+    "versions": [
+      {
+        "changelog": "",
+        "checksum": "c62745cfb240bdcf4a98e61de75388f4",
+        "sourceUrl": "https://github.com/mkudrjasevs/gelato/releases/download/v0.26.0.0/gelato_0.26.15.1.zip",
+        "targetAbi": "10.11.6.0",
+        "timestamp": "2026-06-02T07:20:56Z",
+        "version": "0.26.15.1"
+      }
+    ]
+  }
+]
