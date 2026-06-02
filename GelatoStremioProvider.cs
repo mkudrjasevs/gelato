@@ -1,0 +1,1086 @@
+using System.Globalization;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using MediaBrowser.Controller.Entities;
+using MediaBrowser.Model.Entities;
+using Microsoft.Extensions.Logging;
+
+namespace Gelato;
+
+public class GelatoStremioProvider(
+    string baseUrl,
+    IHttpClientFactory http,
+    ILogger<GelatoStremioProvider> log
+)
+{
+    private StremioManifest? _manifest;
+    private StremioCatalog? _movieSearchCatalog;
+    private StremioCatalog? _seriesSearchCatalog;
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        PropertyNameCaseInsensitive = true,
+    };
+
+    private static readonly TimeSpan MetaCacheTtl = TimeSpan.FromMinutes(5);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<
+        string,
+        (StremioMeta Meta, DateTime Expiry)
+    > _metaCache = new(StringComparer.OrdinalIgnoreCase);
+
+    private StremioMeta? GetCachedMeta(string id)
+    {
+        if (_metaCache.TryGetValue(id, out var entry) && entry.Expiry > DateTime.UtcNow)
+            return entry.Meta;
+        _metaCache.TryRemove(id, out _);
+        return null;
+    }
+
+    private HttpClient NewClient()
+    {
+        var c = http.CreateClient(nameof(GelatoStremioProvider));
+        c.Timeout = TimeSpan.FromSeconds(30);
+        return c;
+    }
+
+    private string BuildUrl(string[] segments, IEnumerable<string>? extras = null)
+    {
+        var parts = segments.Select(Uri.EscapeDataString).ToArray();
+        var path = string.Join("/", parts);
+
+        var extrasPart = string.Empty;
+        if (extras != null)
+        {
+            var enumerable = extras.ToList();
+            extrasPart = enumerable.Count != 0 ? "/" + string.Join("&", enumerable) : string.Empty;
+        }
+
+        var url = $"{baseUrl}/{path}{extrasPart}.json";
+        url = url.Replace("%3A", ":").Replace("%3a", ":");
+        return url;
+    }
+
+    private async Task<T?> GetJsonAsync<T>(string url)
+    {
+        log.LogDebug("GetJsonAsync: requesting {Url}", url);
+
+        try
+        {
+            var c = NewClient();
+            using var resp = await c.GetAsync(url).ConfigureAwait(false);
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                log.LogWarning(
+                    "GetJsonAsync: request failed for {Url} with {StatusCode} {ReasonPhrase}",
+                    url,
+                    resp.StatusCode,
+                    resp.ReasonPhrase
+                );
+
+                throw new HttpRequestException(
+                    $"HTTP {resp.StatusCode}: {resp.ReasonPhrase}",
+                    null,
+                    resp.StatusCode
+                );
+            }
+
+            await using var s = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
+            return await JsonSerializer.DeserializeAsync<T>(s, JsonOpts).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            log.LogError(ex, "GetJsonAsync: error fetching or parsing {Url}", url);
+            throw;
+        }
+    }
+
+    public async Task<StremioManifest?> GetManifestAsync(bool force = false)
+    {
+        if (!force && _manifest is not null)
+            return _manifest;
+        try
+        {
+            var url = $"{baseUrl}/manifest.json";
+            var m = await GetJsonAsync<StremioManifest>(url);
+            _manifest = m;
+
+            if (m?.Catalogs != null)
+            {
+                _movieSearchCatalog = m
+                    .Catalogs.Where(c =>
+                        string.Equals(
+                            c.Type,
+                            nameof(StremioMediaType.Movie),
+                            StringComparison.CurrentCultureIgnoreCase
+                        ) && c.IsSearchCapable()
+                    )
+                    .OrderBy(c => c.Id.Contains("people", StringComparison.OrdinalIgnoreCase))
+                    .FirstOrDefault();
+
+                _seriesSearchCatalog = m
+                    .Catalogs.Where(c =>
+                        string.Equals(
+                            c.Type,
+                            nameof(StremioMediaType.Series),
+                            StringComparison.CurrentCultureIgnoreCase
+                        ) && c.IsSearchCapable()
+                    )
+                    .OrderBy(c => c.Id.Contains("people", StringComparison.OrdinalIgnoreCase))
+                    .FirstOrDefault();
+            }
+
+            if (_movieSearchCatalog == null)
+            {
+                log.LogWarning("manifest has no search-capable movie catalog");
+            }
+            else
+            {
+                log.LogDebug("manifest uses movie search catalog: {Id}", _movieSearchCatalog.Id);
+            }
+
+            if (_seriesSearchCatalog == null)
+            {
+                log.LogWarning("manifest has no search-capable series catalog");
+            }
+            else
+            {
+                log.LogDebug("manifest uses series search catalog: {Id}", _seriesSearchCatalog.Id);
+            }
+            return m;
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "GetManifestAsync: cannot fetch manifest");
+            return null;
+        }
+    }
+
+    public async Task<bool> IsReady()
+    {
+        var m = await GetManifestAsync();
+        return m is not null;
+    }
+
+    public async Task<StremioMeta?> GetMetaAsync(
+        string id,
+        StremioMediaType mediaType,
+        TimeSpan? ttl = null
+    )
+    {
+        var cached = GetCachedMeta(id);
+        if (cached is not null)
+            return cached;
+
+        var url = BuildUrl(["meta", mediaType.ToString().ToLower(), id]);
+        var r = await GetJsonAsync<StremioMetaResponse>(url);
+        if (r?.Meta is { } meta)
+            _metaCache[id] = (meta, DateTime.UtcNow.Add(ttl ?? MetaCacheTtl));
+        return r?.Meta;
+    }
+
+    public async Task<StremioMeta?> GetMetaAsync(BaseItem item)
+    {
+        var id = item.GetProviderId("Imdb");
+        if (id is null)
+        {
+            log.LogWarning("GetMetaAsync: {Name} has no imdb ID", item.Name);
+            id = item.GetProviderId("Tmdb");
+            if (id is null)
+            {
+                log.LogWarning("GetMetaAsync: {Name} has no imdb and tmdb ID", item.Name);
+                return null;
+            }
+            id = $"tmdb:{id}";
+        }
+        return await GetMetaAsync(id, item.GetBaseItemKind().ToStremio()).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Fetches digital (type 4) release dates from TMDB for the given TMDB movie ID
+    /// Uses the TMDB API key from the Jellyfin TMDB plugin if configured, otherwise falls back
+    /// to the built-in default key.
+    /// </summary>
+    private static string GetTmdbApiKey()
+    {
+        const string defaultKey = "4219e299c89411838049ab0dab19ebd5";
+        try
+        {
+            // Avoid a hard compile-time dependency on MediaBrowser.Providers.
+            // Jellyfin.Providers is loaded at runtime — grab the key via reflection if available.
+            var pluginType = Type.GetType(
+                "MediaBrowser.Providers.Plugins.Tmdb.Plugin, Jellyfin.Providers",
+                throwOnError: false
+            );
+            var instance = pluginType?.GetProperty("Instance")?.GetValue(null);
+            var cfg = instance?.GetType().GetProperty("Configuration")?.GetValue(instance);
+            var key = cfg?.GetType().GetProperty("TmdbApiKey")?.GetValue(cfg) as string;
+            return string.IsNullOrWhiteSpace(key) ? defaultKey : key;
+        }
+        catch
+        {
+            return defaultKey;
+        }
+    }
+
+    /// <summary>
+    /// Fetches TMDB release dates for the given movie meta
+    public async Task EnrichDigitalReleaseDateAsync(
+        StremioMeta meta,
+        CancellationToken cancellationToken
+    )
+    {
+        if (meta.App_Extras?.ReleaseDates is not null)
+            return;
+
+        var tmdbId = meta.GetProviderIds().GetValueOrDefault(nameof(MetadataProvider.Tmdb));
+        if (string.IsNullOrWhiteSpace(tmdbId))
+            return;
+
+        var apiKey = GetTmdbApiKey();
+        var url =
+            $"https://api.themoviedb.org/3/movie/{Uri.EscapeDataString(tmdbId)}/release_dates?api_key={apiKey}";
+
+        try
+        {
+            using var client = http.CreateClient(nameof(GelatoStremioProvider));
+            client.Timeout = TimeSpan.FromSeconds(10);
+            var response = await client
+                .GetStringAsync(url, cancellationToken)
+                .ConfigureAwait(false);
+            var container = JsonSerializer.Deserialize<TmdbReleaseDatesContainer>(
+                response,
+                JsonOpts
+            );
+            if (container is not null)
+            {
+                meta.App_Extras ??= new StremioAppExtras();
+                meta.App_Extras.ReleaseDates = container;
+            }
+        }
+        catch (Exception ex)
+        {
+            log.LogDebug(ex, "EnrichDigitalReleaseDate: failed for tmdb:{TmdbId}", tmdbId);
+        }
+    }
+
+    public async Task<List<StremioStream>> GetStreamsAsync(StremioUri uri)
+    {
+        return await GetStreamsAsync(uri.ExternalId, uri.MediaType);
+    }
+
+    private async Task<List<StremioStream>> GetStreamsAsync(string id, StremioMediaType mediaType)
+    {
+        var url = BuildUrl(["stream", mediaType.ToString().ToLower(), id]);
+        var r = await GetJsonAsync<StremioStreamsResponse>(url);
+
+        return r?.Streams ?? [];
+    }
+
+    public async Task<List<StremioSubtitle>> GetSubtitlesAsync(
+        string id,
+        StremioMediaType mediaType
+    )
+    {
+        var url = BuildUrl(["subtitles", mediaType.ToString().ToLower(), id]);
+        var r = await GetJsonAsync<StremioSubtitleResponse>(url);
+        return r.Subtitles;
+    }
+
+    public async Task<IReadOnlyList<StremioMeta>> GetCatalogMetasAsync(
+        string id,
+        string mediaType,
+        string? search = null,
+        int? skip = null
+    )
+    {
+        var extras = new List<string>();
+        if (!string.IsNullOrWhiteSpace(search))
+            extras.Add($"search={Uri.EscapeDataString(search)}");
+        if (skip is > 0)
+            extras.Add($"skip={skip}");
+
+        // seen maybe one type thats capital, but thats their issue
+        var url = BuildUrl(["catalog", mediaType.ToLower(), id], extras);
+        var r = await GetJsonAsync<StremioCatalogResponse>(url);
+        return r?.Metas ?? [];
+    }
+
+    public async Task<IReadOnlyList<StremioMeta>> SearchAsync(
+        string query,
+        StremioMediaType mediaType,
+        int? skip = null
+    )
+    {
+        var manifest = await GetManifestAsync();
+        if (manifest == null)
+            return [];
+
+        var catalog = mediaType switch
+        {
+            StremioMediaType.Movie => _movieSearchCatalog,
+            StremioMediaType.Series => _seriesSearchCatalog,
+            _ => null,
+        };
+
+        if (catalog == null)
+        {
+            log.LogError(
+                "SearchAsync: {mediaType} has no search catalog, please enable one in aiostreams.",
+                mediaType
+            );
+            return [];
+        }
+
+        return await GetCatalogMetasAsync(catalog.Id, mediaType.ToString(), query, skip);
+    }
+}
+
+#region Request Models
+
+// ReSharper disable ClassNeverInstantiated.Global
+// ReSharper disable CollectionNeverUpdated.Global
+// ReSharper disable UnusedAutoPropertyAccessor.Global
+public class StremioManifest
+{
+    public string Name { get; set; } = "";
+    public string Id { get; set; } = "";
+    public string Version { get; set; } = "";
+    public string? Description { get; set; }
+    public List<StremioCatalog> Catalogs { get; set; } = new();
+    public List<StremioResource> Resources { get; set; } = new();
+    public List<string> Types { get; set; } = new();
+    public string? Background { get; set; }
+    public string? Logo { get; set; }
+    public StremioBehaviorHints? BehaviorHints { get; set; }
+    public List<StremioCatalog> AddonCatalogs { get; set; } = new();
+}
+
+public class StremioCatalog
+{
+    // we dont cast to enum cause types is not a static set
+    public string Type { get; set; } = "";
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "";
+    public List<StremioExtra> Extra { get; set; } = new();
+
+    public bool IsSearchCapable()
+    {
+        return Extra.Any(e => string.Equals(e.Name, "search", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // should not have required extras
+    public bool IsImportable()
+    {
+        return !Extra.Any(e => e.IsRequired == true);
+    }
+}
+
+public class StremioExtra
+{
+    public string Name { get; set; } = "";
+    public bool IsRequired { get; set; }
+    public List<string> Options { get; set; } = new();
+}
+
+public class StremioResource
+{
+    public string Name { get; set; } = "";
+    public List<string> Types { get; set; } = new();
+    public List<string> IdPrefixes { get; set; } = new();
+}
+
+public class StremioCatalogResponse
+{
+    public List<StremioMeta>? Metas { get; set; }
+}
+
+public struct StremioSubtitle
+{
+    public string Id { get; set; }
+    public string Url { get; set; }
+    public string? Lang { get; set; }
+    public int? SubId { get; set; }
+    public bool? AiTranslated { get; set; }
+    public bool? FromTrusted { get; set; }
+    public int? UploaderId { get; set; }
+
+    [JsonPropertyName("lang_code")]
+    public string? LangCode { get; set; }
+    public string? Title { get; set; }
+    public string? Moviehash { get; set; }
+
+    public string? TwoLetterISOLanguageName()
+    {
+        var lng = Lang ?? LangCode;
+        if (!string.IsNullOrWhiteSpace(lng))
+        {
+            // If the input is 3 characters, try to convert it to a 2-letter ISO code
+            if (lng.Length == 3)
+            {
+                try
+                {
+                    CultureInfo culture = CultureInfo.GetCultureInfoByIetfLanguageTag(
+                        lng.ToLower()
+                    );
+                    lng = culture.TwoLetterISOLanguageName;
+                }
+                catch (CultureNotFoundException)
+                {
+                    // If the 3-letter code is invalid, return null or handle as needed
+                    return null;
+                }
+            }
+            return lng.ToLower();
+        }
+
+        return null;
+    }
+}
+
+public struct StremioSubtitleResponse
+{
+    public List<StremioSubtitle> Subtitles { get; set; }
+}
+
+public class StremioMetaResponse
+{
+    public StremioMeta Meta { get; set; } = null!;
+}
+
+public class StremioMeta
+{
+    public required string Id { get; set; }
+
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public StremioMediaType Type { get; set; } = StremioMediaType.Unknown;
+    public string? Name { get; set; }
+    public string? Title { get; set; }
+    public string? Poster { get; set; }
+    public List<string>? Genres { get; set; }
+
+    // sometimes string, sometimes number... disable for now
+    // public string? ImdbRating { get; set; }
+    [JsonConverter(typeof(NullableStringLenientConverter))]
+    public string? ReleaseInfo { get; set; }
+    public string? Description { get; set; }
+    public string? Overview { get; set; }
+    public List<StremioTrailer>? Trailers { get; set; }
+    public List<StremioLink>? Links { get; set; }
+    public string? Background { get; set; }
+    public string? Logo { get; set; }
+    public List<StremioMeta>? Videos { get; set; }
+    public string? Runtime { get; set; }
+    public string? Country { get; set; }
+
+    [JsonConverter(typeof(StringOrArrayConverter))]
+    public string? Director { get; set; }
+
+    [JsonConverter(typeof(StringOrArrayConverter))]
+    public string? Writer { get; set; }
+    public string? LandscapePoster { get; set; }
+
+    [JsonConverter(typeof(NullableFloatLenientConverter))]
+    public float? ImdbRating { get; set; }
+
+    public StremioBehaviorHints? BehaviorHints { get; set; }
+    public List<string>? Genre { get; set; }
+
+    [JsonPropertyName("imdb_id")]
+    public string? ImdbId { get; set; }
+    public DateTime? Released { get; set; }
+
+    [JsonConverter(typeof(SafeStringEnumConverter<StremioStatus>))]
+    // ReSharper disable once MemberCanBePrivate.Global
+    public StremioStatus? Status { get; set; } = StremioStatus.Unknown;
+
+    [JsonConverter(typeof(NullableIntLenientConverter))]
+    public int? Year { get; set; }
+    public string? Slug { get; set; }
+    public List<StremioTrailerStream>? TrailerStreams { get; set; }
+
+    // ReSharper disable once InconsistentNaming
+    public StremioAppExtras? App_Extras { get; set; }
+    public string? Thumbnail { get; set; }
+    public int? Episode { get; set; }
+    public int? Season { get; set; }
+    public int? Number { get; set; }
+    public DateTime? FirstAired { get; set; }
+    public Guid? Guid { get; set; }
+
+    public string? TvdbEpisodeId()
+    {
+        if (!Uri.TryCreate(Thumbnail, UriKind.Absolute, out var uri))
+            return null;
+
+        if (!uri.Host.Contains("thetvdb.com", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var lastSegment = uri.Segments.Last().TrimEnd('/');
+
+        return int.TryParse(lastSegment, out _) ? lastSegment : null;
+    }
+
+    public string GetName()
+    {
+        if (!string.IsNullOrWhiteSpace(Title))
+        {
+            return Title;
+        }
+        if (!string.IsNullOrWhiteSpace(Name))
+        {
+            return Name;
+        }
+        return "";
+    }
+
+    public Dictionary<string, string> GetProviderIds()
+    {
+        var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        if (!string.IsNullOrWhiteSpace(Id))
+        {
+            if (Id.StartsWith("tmdb:", StringComparison.OrdinalIgnoreCase))
+            {
+                dict[nameof(MetadataProvider.Tmdb)] = Id["tmdb:".Length..];
+            }
+            else if (Id.StartsWith("tt", StringComparison.OrdinalIgnoreCase))
+            {
+                dict[nameof(MetadataProvider.Imdb)] = Id;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(ImdbId))
+        {
+            dict[nameof(MetadataProvider.Imdb)] = ImdbId;
+        }
+
+        return dict;
+    }
+
+    public int? GetYear()
+    {
+        if (Year is not null)
+            return Year;
+
+        if (Released is { } dt)
+            return dt.Year;
+
+        // "2007-2019", "2020-", or "2015"
+        if (!string.IsNullOrWhiteSpace(ReleaseInfo))
+        {
+            var s = ReleaseInfo.Trim();
+
+            if (
+                s.Length >= 4
+                && int.TryParse(s.AsSpan(0, 4), out var startYear)
+                && startYear is > 1800 and < 2200
+            )
+                return startYear;
+
+            var dashIndex = s.IndexOf('-');
+            if (
+                dashIndex > 0
+                && int.TryParse(s[..dashIndex], out var year2)
+                && year2 is > 1800 and < 2200
+            )
+                return year2;
+
+            if (int.TryParse(s, out var plainYear) && plainYear is > 1800 and < 2200)
+                return plainYear;
+        }
+
+        return null;
+    }
+
+    public DateTime? GetPremiereDate()
+    {
+        if (Released is { } dt)
+            return dt;
+
+        var year = GetYear();
+        if (year is null)
+        {
+            return null;
+        }
+        return new DateTime(year.Value, 1, 1);
+    }
+
+    /// <summary>
+    /// Returns the earliest digital (TMDB type 4) release date across all countries, or null if unavailable.
+    /// </summary>
+    public DateTime? GetDigitalReleaseDate()
+    {
+        var results = App_Extras?.ReleaseDates?.Results;
+        if (results is null)
+            return null;
+
+        DateTime? earliest = null;
+        foreach (var country in results)
+        {
+            if (country.ReleaseDates is null)
+                continue;
+            foreach (var rd in country.ReleaseDates)
+            {
+                if (rd.Type == 4 && rd.ReleaseDate.HasValue)
+                {
+                    if (earliest is null || rd.ReleaseDate.Value < earliest.Value)
+                        earliest = rd.ReleaseDate.Value;
+                }
+            }
+        }
+        return earliest;
+    }
+
+    public bool IsValid()
+    {
+        return !Id.Contains("error");
+    }
+
+    public bool IsReleased(int bufferDays = 0)
+    {
+        var now = DateTime.UtcNow;
+
+        if (Type == StremioMediaType.Movie)
+        {
+            var digital = GetDigitalReleaseDate();
+            if (digital.HasValue)
+                return digital.Value.AddDays(bufferDays) <= now;
+
+            // Old media without a digital release date — if premiered > 1 year ago, treat as released.
+            if (Released.HasValue && Released.Value < now.AddYears(-1))
+                return true;
+        }
+
+        if (Released.HasValue)
+        {
+            return Released.Value.AddDays(bufferDays) <= now;
+        }
+
+        // Check FirstAired for TV episodes
+        if (FirstAired.HasValue)
+        {
+            return FirstAired.Value.AddDays(bufferDays) <= now;
+        }
+
+        if (Status is not null)
+        {
+            if (Status == StremioStatus.Upcoming)
+                return false;
+            if (Status == StremioStatus.Ended || Status == StremioStatus.Continuing)
+                return true;
+        }
+
+        // Fall back to year-based check
+        var year = GetYear();
+        if (year.HasValue)
+        {
+            var estimatedRelease = new DateTime(year.Value, 1, 1).AddDays(bufferDays);
+            return estimatedRelease <= now;
+        }
+
+        // If we have no release information, assume it's not released
+        return false;
+    }
+
+    public StremioStatus? GetStatus()
+    {
+        // Explicit status field takes priority
+        if (Status is not null and not StremioStatus.Unknown)
+            return Status;
+
+        // releaseInfo: "1994-" → continuing, "1994-2004" → ended, "2026" → unreleased
+        if (!string.IsNullOrWhiteSpace(ReleaseInfo))
+        {
+            var trimmed = ReleaseInfo.Trim();
+            if (trimmed.EndsWith('-'))
+                return StremioStatus.Continuing;
+            if (trimmed.Contains('-'))
+                return StremioStatus.Ended;
+            // Single year — fall through to episode check below
+        }
+
+        // Check S1E1: if it exists and hasn't been released yet → Upcoming
+        var s1e1 = Videos?.FirstOrDefault(v => v.Season == 1 && v.Episode == 1);
+        if (s1e1 is not null)
+        {
+            if (s1e1.Released.HasValue && s1e1.Released.Value > DateTime.UtcNow)
+                return StremioStatus.Upcoming;
+            if (s1e1.Released.HasValue)
+                return StremioStatus.Continuing;
+        }
+
+        // Single year in releaseInfo with no other signals → Upcoming
+        if (!string.IsNullOrWhiteSpace(ReleaseInfo) && !ReleaseInfo.Contains('-'))
+            return StremioStatus.Upcoming;
+
+        return null;
+    }
+}
+
+public class StremioTrailer
+{
+    public string? Source { get; set; }
+    public string? Type { get; set; }
+}
+
+public class StremioLink
+{
+    public string? Name { get; set; }
+    public string? Category { get; set; }
+    public string? Url { get; set; }
+}
+
+public class StremioVideo
+{
+    public string Id { get; set; } = "";
+    public string? Name { get; set; }
+    public DateTime? Released { get; set; }
+    public string? Thumbnail { get; set; }
+    public int? Episode { get; set; }
+    public int? Season { get; set; }
+    public string? Overview { get; set; }
+    public int? Number { get; set; }
+    public string? Description { get; set; }
+    public string? Rating { get; set; }
+    public DateTime? FirstAired { get; set; }
+}
+
+public class StremioTrailerStream
+{
+    public string? Title { get; set; }
+    public string? YtId { get; set; }
+}
+
+public class StremioAppExtras
+{
+    public List<StremioCast>? Cast { get; set; }
+    public List<StremioCast>? Directors { get; set; }
+    public List<StremioCast>? Writers { get; set; }
+    public string? Certification { get; set; }
+    public List<String?>? SeasonPosters { get; set; }
+
+    [JsonPropertyName("releaseDates")]
+    public TmdbReleaseDatesContainer? ReleaseDates { get; set; }
+}
+
+public class TmdbReleaseDatesContainer
+{
+    public List<TmdbReleaseDateCountry>? Results { get; set; }
+}
+
+public class TmdbReleaseDateCountry
+{
+    [JsonPropertyName("iso_3166_1")]
+    public string? Iso31661 { get; set; }
+
+    [JsonPropertyName("release_dates")]
+    public List<TmdbReleaseDateItem>? ReleaseDates { get; set; }
+}
+
+public class TmdbReleaseDateItem
+{
+    [JsonPropertyName("release_date")]
+    public DateTime? ReleaseDate { get; set; }
+
+    /// <summary>TMDB release type: 1=Premiere, 2=LimitedTheatrical, 3=Theatrical, 4=Digital, 5=Physical, 6=TV</summary>
+    public int Type { get; set; }
+
+    public string? Certification { get; set; }
+}
+
+public class StremioCast
+{
+    public string? Name { get; set; }
+    public string? Character { get; set; }
+    public string? Photo { get; set; }
+}
+
+public class StremioStreamsResponse
+{
+    public List<StremioStream> Streams { get; set; } = new();
+
+}
+
+public class StremioStream
+{
+    public string Url { get; set; } = "";
+    public string? Title { get; set; }
+    public string? Name { get; set; }
+    public string? Description { get; set; }
+    public string? Quality { get; set; }
+    public string? Subtitle { get; set; }
+    public string? Audio { get; set; }
+    public string? InfoHash { get; set; }
+    public int? FileIdx { get; set; }
+    public List<string>? Sources { get; set; }
+    public StremioBehaviorHints? BehaviorHints { get; set; }
+
+    public string GetName()
+    {
+        if (!string.IsNullOrWhiteSpace(Title))
+        {
+            return Title;
+        }
+        return !string.IsNullOrWhiteSpace(Name) ? Name : "";
+    }
+
+    public Guid GetGuid()
+    {
+        string key;
+
+        // Prefer URL identity when a direct URL exists, even if InfoHash is present.
+        // Some providers attach the same InfoHash to multiple hosters (e.g. Dropload/SuperVideo).
+        if (!string.IsNullOrEmpty(Url))
+        {
+            key = Url;
+        }
+        else if (!string.IsNullOrEmpty(InfoHash))
+        {
+            key = InfoHash;
+        }
+        else if (
+            !string.IsNullOrEmpty(BehaviorHints?.BingeGroup)
+            && !string.IsNullOrEmpty(BehaviorHints?.Filename)
+        )
+        {
+            key = $"{BehaviorHints?.BingeGroup}{BehaviorHints?.Filename}";
+        }
+        else
+        {
+            throw new Exception("Cannot build guid for stream");
+        }
+
+        var bytes = System.Text.Encoding.UTF8.GetBytes(key);
+        var hash = System.Security.Cryptography.MD5.HashData(bytes);
+        return new Guid(hash);
+    }
+
+    public bool IsValid()
+    {
+        if (string.IsNullOrWhiteSpace(Url))
+            return false;
+
+        if (!Uri.TryCreate(Url, UriKind.Absolute, out var uri))
+            return false;
+
+        return !(uri.PathAndQuery == "/" || string.IsNullOrEmpty(uri.PathAndQuery));
+    }
+
+    public bool IsFile()
+    {
+        return !string.IsNullOrWhiteSpace(Url);
+    }
+
+    public bool IsTorrent()
+    {
+        return !string.IsNullOrWhiteSpace(InfoHash);
+    }
+}
+
+public class StremioBehaviorHints
+{
+    public string? BingeGroup { get; set; }
+    public string? VideoHash { get; set; }
+    public long? VideoSize { get; set; }
+    public string? Filename { get; set; }
+    public bool Configurable { get; set; }
+    public bool ConfigurationRequired { get; set; }
+}
+
+public class StremioOptions
+{
+    public string BaseUrl { get; set; } = "https://your-stremio-addon";
+    public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(8);
+}
+
+public enum StremioMediaType
+{
+    Unknown = 0,
+    Movie,
+    Series,
+    Episode, // doesnt exist in stremio. But we wanna know
+    Channel,
+    Collections,
+    Anime,
+    Other,
+    Tv,
+    Events,
+}
+
+public enum StremioStatus
+{
+    Unknown = 0,
+    Upcoming,
+    Ended,
+    Continuing,
+}
+
+// ReSharper restore UnusedAutoPropertyAccessor.Global
+// ReSharper restore CollectionNeverUpdated.Global
+// ReSharper restore ClassNeverInstantiated.Global
+
+#endregion
+
+public class SafeStringEnumConverter<T> : JsonConverter<T>
+    where T : struct, Enum
+{
+    public override T Read(
+        ref Utf8JsonReader reader,
+        Type typeToConvert,
+        JsonSerializerOptions options
+    )
+    {
+        if (reader.TokenType == JsonTokenType.String)
+        {
+            var s = reader.GetString();
+            if (Enum.TryParse<T>(s, true, out var value))
+                return value;
+            if (Enum.TryParse<T>("Unknown", true, out var fallback))
+                return fallback;
+        }
+        if (reader.TokenType == JsonTokenType.Number)
+        {
+            if (reader.TryGetInt32(out var i) && Enum.IsDefined(typeof(T), i))
+                return (T)Enum.ToObject(typeof(T), i);
+        }
+        reader.Skip();
+        return Enum.TryParse<T>("Unknown", true, out var fb) ? fb : default;
+    }
+
+    public override void Write(Utf8JsonWriter writer, T value, JsonSerializerOptions options) =>
+        writer.WriteStringValue(value.ToString());
+}
+
+public sealed class NullableIntLenientConverter : JsonConverter<int?>
+{
+    public override int? Read(ref Utf8JsonReader r, Type t, JsonSerializerOptions o)
+    {
+        switch (r.TokenType)
+        {
+            case JsonTokenType.Number:
+                return r.TryGetInt32(out var i) ? i : null;
+            case JsonTokenType.String:
+                var s = r.GetString();
+                if (string.IsNullOrWhiteSpace(s))
+                    return null;
+
+                return int.TryParse(
+                    s,
+                    NumberStyles.Integer,
+                    CultureInfo.InvariantCulture,
+                    out var v
+                )
+                    ? v
+                    : null;
+            case JsonTokenType.Null:
+            default:
+                return null;
+        }
+    }
+
+    public override void Write(Utf8JsonWriter w, int? v, JsonSerializerOptions o)
+    {
+        if (v.HasValue)
+            w.WriteNumberValue(v.Value);
+        else
+            w.WriteNullValue();
+    }
+}
+
+public sealed class NullableStringLenientConverter : JsonConverter<string?>
+{
+    public override string? Read(ref Utf8JsonReader r, Type t, JsonSerializerOptions o)
+    {
+        return r.TokenType switch
+        {
+            JsonTokenType.String => r.GetString(),
+            JsonTokenType.Number => r.TryGetInt64(out var i)
+                ? i.ToString(CultureInfo.InvariantCulture)
+                : r.GetDouble().ToString(CultureInfo.InvariantCulture),
+            _ => null,
+        };
+    }
+
+    public override void Write(Utf8JsonWriter w, string? v, JsonSerializerOptions o)
+    {
+        if (v is not null)
+            w.WriteStringValue(v);
+        else
+            w.WriteNullValue();
+    }
+}
+
+public sealed class NullableFloatLenientConverter : JsonConverter<float?>
+{
+    public override float? Read(ref Utf8JsonReader r, Type t, JsonSerializerOptions o)
+    {
+        switch (r.TokenType)
+        {
+            case JsonTokenType.Number:
+                return r.TryGetSingle(out var f) ? f : null;
+            case JsonTokenType.String:
+                var s = r.GetString();
+                return float.TryParse(
+                    s,
+                    NumberStyles.Float,
+                    CultureInfo.InvariantCulture,
+                    out var v
+                )
+                    ? v
+                    : null;
+            case JsonTokenType.Null:
+            default:
+                return null;
+        }
+    }
+
+    public override void Write(Utf8JsonWriter w, float? v, JsonSerializerOptions o)
+    {
+        if (v.HasValue)
+            w.WriteNumberValue(v.Value);
+        else
+            w.WriteNullValue();
+    }
+}
+
+/// <summary>
+/// Handles fields that can be either a JSON string or an array of strings.
+/// Arrays are joined with ", ". Numbers are coerced to string. Null/other → null.
+/// </summary>
+public sealed class StringOrArrayConverter : JsonConverter<string?>
+{
+    public override string? Read(ref Utf8JsonReader r, Type t, JsonSerializerOptions o)
+    {
+        switch (r.TokenType)
+        {
+            case JsonTokenType.String:
+                return r.GetString();
+            case JsonTokenType.Number:
+                return r.TryGetInt64(out var i)
+                    ? i.ToString(CultureInfo.InvariantCulture)
+                    : r.GetDouble().ToString(CultureInfo.InvariantCulture);
+            case JsonTokenType.StartArray:
+                var parts = new List<string>();
+                while (r.Read() && r.TokenType != JsonTokenType.EndArray)
+                {
+                    if (r.TokenType == JsonTokenType.String)
+                    {
+                        var s = r.GetString();
+                        if (!string.IsNullOrWhiteSpace(s))
+                            parts.Add(s);
+                    }
+                }
+                return parts.Count > 0 ? string.Join(", ", parts) : null;
+            default:
+                return null;
+        }
+    }
+
+    public override void Write(Utf8JsonWriter w, string? v, JsonSerializerOptions o)
+    {
+        if (v is not null)
+            w.WriteStringValue(v);
+        else
+            w.WriteNullValue();
+    }
+}
