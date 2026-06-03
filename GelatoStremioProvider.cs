@@ -84,6 +84,24 @@ public class GelatoStremioProvider(
                 );
             }
 
+            // Guard against HTML error pages returned with a 200 status (e.g. captive
+            // portals, auth redirects, Nginx error pages). Without this check, the JSON
+            // parser throws a confusing "'<' is an invalid start of a value" error that
+            // gives no hint about what the server actually returned.
+            var contentType = resp.Content.Headers.ContentType?.MediaType ?? string.Empty;
+            if (!contentType.Contains("json", StringComparison.OrdinalIgnoreCase))
+            {
+                var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                var snippet = body.Length > 300 ? body[..300] + "…" : body;
+                log.LogError(
+                    "GetJsonAsync: server returned {ContentType} instead of JSON for {Url} — body: {Snippet}",
+                    string.IsNullOrEmpty(contentType) ? "(no content-type)" : contentType,
+                    url,
+                    snippet
+                );
+                return default;
+            }
+
             await using var s = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
             return await JsonSerializer.DeserializeAsync<T>(s, JsonOpts).ConfigureAwait(false);
         }
