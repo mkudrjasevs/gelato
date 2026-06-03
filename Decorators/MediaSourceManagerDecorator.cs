@@ -441,7 +441,9 @@ public sealed class MediaSourceManagerDecorator(
         if (withPath.Count > 0)
             ordered = withPath;
 
-        if (ctx?.GetActionName() == "GetPostedPlaybackInfo")
+        var actionName = ctx?.GetActionName();
+
+        if (actionName == "GetPostedPlaybackInfo")
         {
             foreach (var src in ordered)
             {
@@ -451,6 +453,15 @@ public sealed class MediaSourceManagerDecorator(
                 src.IsRemote = false;
                 src.Protocol = MediaProtocol.File;
             }
+        }
+        else if (ordered.Count > 1)
+        {
+            // For streaming actions (GetVideoStream, GetPlaybackInfo, etc.) only the
+            // selected source is needed. Returning all N sources causes Jellyfin's
+            // StreamBuilder to evaluate every one for direct-play/transcode compatibility,
+            // logging "User policy for …" N×3-4 times and burning proportional CPU.
+            // The full list is only necessary for GetPostedPlaybackInfo (version picker).
+            ordered = [ordered[0]];
         }
 
         ordered[0].Type = MediaSourceType.Default;
