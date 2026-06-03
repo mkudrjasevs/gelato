@@ -377,6 +377,9 @@ public sealed class MediaSourceManagerDecorator(
             mediaSourceId
         );
 
+        // Compute action name early — used to gate probing and source trimming below.
+        var actionName = ctx?.GetActionName();
+
         // Identify the preferred source (explicit client choice, or first available).
         var selected = SelectByIdOrFirst(sources, mediaSourceId);
         if (selected is null)
@@ -391,7 +394,13 @@ public sealed class MediaSourceManagerDecorator(
                 return sources;
         }
 
-        if (NeedsProbe(selected) && !IsProbeOnCooldown(owner.Id))
+        // Only probe on the initial playback setup request (GetPostedPlaybackInfo /
+        // GetPlaybackInfo). When seeking, the client calls GetHlsVideoSegment which
+        // also reaches GetPlaybackMediaSources. Re-probing there adds a 2-5 second
+        // network round-trip before FFmpeg even starts, causing the client to time out
+        // waiting for the first segment and showing "Fatal playback error".
+        var isSetupAction = actionName is "GetPostedPlaybackInfo" or "GetPlaybackInfo" or null;
+        if (isSetupAction && NeedsProbe(selected) && !IsProbeOnCooldown(owner.Id))
         {
             // RunSingleFlightAsync deduplicates concurrent probes for the same source.
             // Without it, multiple simultaneous requests each call ProbeStreamAsync and
@@ -484,8 +493,6 @@ public sealed class MediaSourceManagerDecorator(
         }
         if (withPath.Count > 0)
             ordered = withPath;
-
-        var actionName = ctx?.GetActionName();
 
         if (actionName == "GetPostedPlaybackInfo")
         {
