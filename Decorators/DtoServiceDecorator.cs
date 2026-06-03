@@ -15,8 +15,13 @@ public sealed class DtoServiceDecorator(IDtoService inner, Lazy<GelatoManager> m
 {
     private readonly Lazy<GelatoManager> _manager = manager;
     private readonly IHttpContextAccessor _http = http;
-    private const int PrefetchConcurrency = 3;
-    private const int PrefetchLimit = 20;
+    private const int PrefetchLimit = 10;
+
+    // Global cap on concurrent background stream prefetches across all in-flight list
+    // responses. Without this, a home-screen load (5-6 concurrent list requests, each
+    // with its own per-call semaphore) saturates the thread pool with 15-20 simultaneous
+    // SyncStreams calls. Items that can't acquire a slot are skipped and loaded on-demand.
+    private static readonly SemaphoreSlim _globalPrefetchThrottle = new(4, 4);
 
     public double? GetPrimaryImageAspectRatio(BaseItem item) =>
         inner.GetPrimaryImageAspectRatio(item);
@@ -95,11 +100,13 @@ public sealed class DtoServiceDecorator(IDtoService inner, Lazy<GelatoManager> m
 
         _ = Task.Run(async () =>
         {
-            using var throttle = new SemaphoreSlim(PrefetchConcurrency, PrefetchConcurrency);
-
             var tasks = toPrefetch.Select(async baseItem =>
             {
-                await throttle.WaitAsync().ConfigureAwait(false);
+                // Non-blocking: if the global prefetch limit is already saturated
+                // (another list response is running concurrent prefetches), skip
+                // this item. It will be synced on-demand when the user opens it.
+                if (!await _globalPrefetchThrottle.WaitAsync(TimeSpan.Zero).ConfigureAwait(false))
+                    return;
                 try
                 {
                     var count = await manager
@@ -109,13 +116,10 @@ public sealed class DtoServiceDecorator(IDtoService inner, Lazy<GelatoManager> m
                     if (count > 0)
                         manager.SetStreamSync($"{userId}:{baseItem.Id}");
                 }
-                catch
-                {
-                    // Non-critical background prefetch — swallow silently
-                }
+                catch { }
                 finally
                 {
-                    throttle.Release();
+                    _globalPrefetchThrottle.Release();
                 }
             });
 
