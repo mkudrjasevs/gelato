@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using Gelato.Providers;
 using Gelato.Services;
 using Jellyfin.Data;
@@ -234,25 +235,38 @@ public sealed class MediaSourceManagerDecorator(
             };
         }
 
+        // Parse each stream item's ExternalId JSON once and thread it through the
+        // filter, sort, and GetVersionInfo rather than calling GelatoData<T> (which
+        // deserialises the full JSON every time) once per key.  Without this,
+        // a 26-stream movie deserialises its JSON 4-5 times per item = 100-130
+        // redundant JsonSerializer.Deserialize calls per GetStaticMediaSources call.
+        //
+        // Sort key is extracted into a named tuple field BEFORE OrderBy so the
+        // comparison-based sort doesn't re-invoke GetAllGelatoData O(N log N) times.
         var gelatoSources = repo.GetItemList(query)
             .OfType<Video>()
-            .Where(x =>
-                x.IsGelato()
-                && (
-                    userId == Guid.Empty
-                    || (x.GelatoData<List<Guid>>("userIds")?.Contains(userId) ?? false)
-                )
-            )
-            .OrderBy(x => x.GelatoData<int?>("index") ?? int.MaxValue)
-            .Select(s =>
+            .Where(x => x.IsGelato())
+            .Select(x => (Item: x, Data: x.GetAllGelatoData()))
+            .Where(t =>
             {
-                var k = GetVersionInfo(s, MediaSourceType.Grouping, user);
-
+                if (userId == Guid.Empty) return true;
+                if (t.Data == null) return false;
+                if (!t.Data.TryGetValue("userIds", out var u)) return false;
+                return u.Deserialize<List<Guid>>()?.Contains(userId) ?? false;
+            })
+            .Select(t => (
+                t.Item,
+                t.Data,
+                SortIndex: t.Data != null && t.Data.TryGetValue("index", out var idx)
+                    ? idx.Deserialize<int?>() ?? int.MaxValue
+                    : int.MaxValue
+            ))
+            .OrderBy(t => t.SortIndex)
+            .Select(t =>
+            {
+                var k = GetVersionInfo(t.Item, MediaSourceType.Grouping, user, t.Data);
                 if (user is not null)
-                {
                     _inner.SetDefaultAudioAndSubtitleStreamIndices(item, k, user);
-                }
-
                 return k;
             })
             .ToList();
@@ -577,14 +591,21 @@ public sealed class MediaSourceManagerDecorator(
     private MediaSourceInfo GetVersionInfo(
         BaseItem item,
         MediaSourceType type,
-        User? user = null
+        User? user = null,
+        Dictionary<string, JsonElement>? data = null
     )
     {
         ArgumentNullException.ThrowIfNull(item);
 
-        var streamName = item.GelatoData<string>("name");
-        var streamDesc = item.GelatoData<string>("description");
-        var bingeGroup = item.GelatoData<string>("bingeGroup");
+        // Use pre-parsed ExternalId data when available (passed from the loop that
+        // already called GetAllGelatoData); otherwise parse once here.
+        data ??= item.GetAllGelatoData();
+
+        static T? Get<T>(Dictionary<string, JsonElement>? d, string key) =>
+            d != null && d.TryGetValue(key, out var el) ? el.Deserialize<T>() : default;
+
+        var streamName = Get<string>(data, "name");
+        var streamDesc = Get<string>(data, "description");
         var richName = !string.IsNullOrEmpty(streamDesc)
             ? $"{streamName}\n{streamDesc}"
             : streamName;
@@ -594,8 +615,11 @@ public sealed class MediaSourceManagerDecorator(
             Id = item.Id.ToString("N", CultureInfo.InvariantCulture),
             ETag = item.Id.ToString("N", CultureInfo.InvariantCulture),
             Protocol = MediaProtocol.Http,
-            MediaStreams = GetMediaStreamsWithExternalSubs(item),
-            MediaAttachments = _inner.GetMediaAttachments(item.Id),
+            MediaStreams = GetMediaStreamsWithExternalSubs(item, Get<string>(data, "filename")),
+            // Gelato stream sources are HTTP streams — they never carry embedded
+            // attachments (those are MKV-embedded fonts/cover art). Returning an empty
+            // array avoids a per-stream DB round-trip that always returns nothing.
+            MediaAttachments = [],
             Name = richName,
             Path = item.Path,
             RunTimeTicks = item.RunTimeTicks,
@@ -661,11 +685,10 @@ public sealed class MediaSourceManagerDecorator(
     // metadata folder are never discovered during library refresh and never written to the DB.
     // We work around this by scanning the metadata folder ourselves at playback time and merging
     // any matching subtitle files into the DB streams on the fly.
-    private IReadOnlyList<MediaStream> GetMediaStreamsWithExternalSubs(BaseItem item)
+    private IReadOnlyList<MediaStream> GetMediaStreamsWithExternalSubs(BaseItem item, string? gelatoFilename)
     {
         var streams = _inner.GetMediaStreams(item.Id).ToList();
 
-        var gelatoFilename = item.GelatoData<string>("filename");
         if (string.IsNullOrEmpty(gelatoFilename))
             return streams;
 
