@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -55,6 +56,13 @@ public sealed class MediaSourceManagerDecorator(
     private readonly IHttpContextAccessor _http =
         http ?? throw new ArgumentNullException(nameof(http));
     private readonly KeyLock _lock = new();
+
+    // Sources whose probe returned an HTTP error (e.g. 403) are put on cooldown so
+    // we don't hammer the remote server or spin in a repeated-probe loop.
+    private static readonly ConcurrentDictionary<Guid, DateTime> _probeCooldowns = new();
+    private static readonly TimeSpan _probeCooldownDuration = TimeSpan.FromMinutes(10);
+    private static bool IsProbeOnCooldown(Guid id) =>
+        _probeCooldowns.TryGetValue(id, out var t) && DateTime.UtcNow - t < _probeCooldownDuration;
     private readonly IMediaSegmentManager _mediaSegmentManager =
         mediaSegmentManager ?? throw new ArgumentNullException(nameof(mediaSegmentManager));
     private readonly ILibraryManager _libraryManager =
@@ -383,23 +391,45 @@ public sealed class MediaSourceManagerDecorator(
                 return sources;
         }
 
-        if (NeedsProbe(selected))
+        if (NeedsProbe(selected) && !IsProbeOnCooldown(owner.Id))
         {
-            var libraryOptions = _libraryManager.GetLibraryOptions(owner);
+            // RunSingleFlightAsync deduplicates concurrent probes for the same source.
+            // Without it, multiple simultaneous requests each call ProbeStreamAsync and
+            // all race to modify owner.Path on the same in-memory item.
+            await _lock.RunSingleFlightAsync(owner.Id, async innerCt =>
+            {
+                // Re-check after acquiring the token — a concurrent caller may have
+                // finished probing this source while we were waiting.
+                var recheck = GetStaticMediaSources(item, enablePathSubstitution, user);
+                if (SelectByIdOrFirst(recheck, mediaSourceId) is { } rec && !NeedsProbe(rec))
+                    return;
+                if (IsProbeOnCooldown(owner.Id))
+                    return;
 
-            var segmentTask = _mediaSegmentManager.RunSegmentPluginProviders(
-                owner,
-                libraryOptions,
-                false,
-                ct
-            );
-            var metadataTask = ProbeStreamAsync((Video)owner, selected.Path, ct);
+                var libraryOptions = _libraryManager.GetLibraryOptions(owner);
+                var segmentTask = _mediaSegmentManager.RunSegmentPluginProviders(
+                    owner,
+                    libraryOptions,
+                    false,
+                    innerCt
+                );
+                var probeTask = ProbeStreamAsync((Video)owner, selected.Path, innerCt);
+                await Task.WhenAll(probeTask, segmentTask).ConfigureAwait(false);
 
-            await Task.WhenAll(metadataTask, segmentTask).ConfigureAwait(false);
-
-            await owner
-                .UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, ct)
-                .ConfigureAwait(false);
+                if (await probeTask)
+                {
+                    await owner
+                        .UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, innerCt)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    // Probe failed (e.g. HTTP 403 from remote). Enter cooldown so we
+                    // don't re-probe this source for the next 10 minutes. A re-sync of
+                    // the stream list will clear stale URLs when the TTL expires.
+                    _probeCooldowns[owner.Id] = DateTime.UtcNow;
+                }
+            }, ct).ConfigureAwait(false);
 
             var refreshed = GetStaticMediaSources(item, enablePathSubstitution, user);
             selected = SelectByIdOrFirst(refreshed, mediaSourceId);
@@ -747,7 +777,7 @@ public sealed class MediaSourceManagerDecorator(
         return streams;
     }
 
-    private async Task ProbeStreamAsync(Video owner, string streamUrl, CancellationToken ct)
+    private async Task<bool> ProbeStreamAsync(Video owner, string streamUrl, CancellationToken ct)
     {
         var gelatoFilename = owner.GelatoData<string>("filename");
         var strmBaseName = !string.IsNullOrEmpty(gelatoFilename)
@@ -773,10 +803,17 @@ public sealed class MediaSourceManagerDecorator(
                 },
                 ct
             );
+            return true;
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "Stream probe failed for {Id}", owner.Id);
+            _log.LogWarning(
+                ex,
+                "Stream probe failed for {Id} — entering {Mins}min cooldown",
+                owner.Id,
+                (int)_probeCooldownDuration.TotalMinutes
+            );
+            return false;
         }
         finally
         {
