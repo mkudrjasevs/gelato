@@ -9,6 +9,14 @@
     "versions": [
       {
         "changelog": "",
+        "checksum": "ce919a0304e511b72475181575c96885",
+        "sourceUrl": "https://github.com/mkudrjasevs/gelato/releases/download/v0.27.0.9/gelato_0.27.0.9.zip",
+        "targetAbi": "10.11.6.0",
+        "timestamp": "2026-06-03T12:26:55Z",
+        "version": "0.27.0.9"
+      },
+      {
+        "changelog": "",
         "checksum": "a2d0409659f5e50c7c1d1eae6567694d",
         "sourceUrl": "https://github.com/mkudrjasevs/gelato/releases/download/v0.27.0.8/gelato_0.27.0.8.zip",
         "targetAbi": "10.11.6.0",
