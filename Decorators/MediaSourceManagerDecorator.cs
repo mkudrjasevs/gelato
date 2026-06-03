@@ -415,20 +415,41 @@ public sealed class MediaSourceManagerDecorator(
         var ordered = new List<MediaSourceInfo>(sources.Count) { selected };
         ordered.AddRange(sources.Where(s => s.Id != selected.Id));
 
+        // Strip placeholder sources that have no path. A null-path source with
+        // IsRemote=true causes ArgumentNullException inside Jellyfin's
+        // GetStaticRemoteStreamResult when the client tries to stream it directly.
+        var withPath = ordered.Where(s => !string.IsNullOrEmpty(s.Path)).ToList();
+        if (withPath.Count == 0 && ordered.Count > 0)
+        {
+            // No real streams available yet — attempt a blocking on-demand sync
+            // so the client gets actual sources instead of crashing Jellyfin.
+            try
+            {
+                var syncCount = await manager.SyncStreams(item, user.Id, ct).ConfigureAwait(false);
+                if (syncCount > 0)
+                {
+                    manager.SetStreamSync($"{user.Id}:{item.Id}");
+                    var fresh = GetStaticMediaSources(item, enablePathSubstitution, user);
+                    withPath = fresh.Where(s => !string.IsNullOrEmpty(s.Path)).ToList();
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "On-demand stream sync failed for {Id}", item.Id);
+            }
+        }
+        if (withPath.Count > 0)
+            ordered = withPath;
+
         if (ctx?.GetActionName() == "GetPostedPlaybackInfo")
         {
             foreach (var src in ordered)
             {
-                // Only stub sources that have a real path to back them up.
-                // Leaving placeholder sources (null path) unstubbed prevents
-                // Jellyfin from treating them as File-protocol streams and
-                // passing an empty string to FFmpeg.
-                if (!string.IsNullOrEmpty(src.Path))
-                {
-                    src.Path = "/stub";
-                    src.IsRemote = false;
-                    src.Protocol = MediaProtocol.File;
-                }
+                // All sources in ordered now have non-null paths (filtered above),
+                // so stub all of them unconditionally.
+                src.Path = "/stub";
+                src.IsRemote = false;
+                src.Protocol = MediaProtocol.File;
             }
         }
 

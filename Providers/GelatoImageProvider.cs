@@ -8,10 +8,11 @@ using Microsoft.Extensions.Logging;
 
 namespace Gelato.Providers;
 
-public sealed class GelatoImageProvider(ILogger<GelatoImageProvider> log)
+public sealed class GelatoImageProvider(ILogger<GelatoImageProvider> log, IHttpClientFactory httpClientFactory)
     : IRemoteImageProvider,
         IHasOrder
 {
+    private readonly IHttpClientFactory _httpClientFactory = httpClientFactory;
     public string Name => "Gelato";
     public int Order => 0;
 
@@ -57,7 +58,7 @@ public sealed class GelatoImageProvider(ILogger<GelatoImageProvider> log)
     public Task<HttpResponseMessage> GetImageResponse(
         string url,
         CancellationToken cancellationToken
-    ) => throw new NotImplementedException();
+    ) => _httpClientFactory.CreateClient("gelato").GetAsync(url, cancellationToken);
 
     private static IEnumerable<RemoteImageInfo> BuildImages(StremioMeta meta)
     {
