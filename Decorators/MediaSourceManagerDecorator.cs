@@ -63,6 +63,15 @@ public sealed class MediaSourceManagerDecorator(
     private static readonly TimeSpan _probeCooldownDuration = TimeSpan.FromMinutes(10);
     private static bool IsProbeOnCooldown(Guid id) =>
         _probeCooldowns.TryGetValue(id, out var t) && DateTime.UtcNow - t < _probeCooldownDuration;
+
+    private static void EnterProbeCooldown(Guid ownerId, GelatoManager manager, Guid userId, Guid itemId)
+    {
+        _probeCooldowns[ownerId] = DateTime.UtcNow;
+        // Clear the stream sync cache so the NEXT GetPostedPlaybackInfo call triggers
+        // a fresh sync from the Stremio addon — the failed URL may be expired/invalid,
+        // and a re-sync will obtain a new, working URL.
+        manager.ClearStreamSync($"{userId}:{itemId}");
+    }
     private readonly IMediaSegmentManager _mediaSegmentManager =
         mediaSegmentManager ?? throw new ArgumentNullException(nameof(mediaSegmentManager));
     private readonly ILibraryManager _libraryManager =
@@ -396,10 +405,10 @@ public sealed class MediaSourceManagerDecorator(
 
         // Only probe on the initial playback setup request (GetPostedPlaybackInfo /
         // GetPlaybackInfo). When seeking, the client calls GetHlsVideoSegment which
-        // also reaches GetPlaybackMediaSources. Re-probing there adds a 2-5 second
-        // network round-trip before FFmpeg even starts, causing the client to time out
-        // waiting for the first segment and showing "Fatal playback error".
-        var isSetupAction = actionName is "GetPostedPlaybackInfo" or "GetPlaybackInfo" or null;
+        // also reaches GetPlaybackMediaSources. Re-probing there adds network latency
+        // before FFmpeg even starts, causing the client to time out. Exclude null so
+        // that calls from unknown/internal code paths don't accidentally probe.
+        var isSetupAction = actionName is "GetPostedPlaybackInfo" or "GetPlaybackInfo";
         if (isSetupAction && NeedsProbe(selected) && !IsProbeOnCooldown(owner.Id))
         {
             // RunSingleFlightAsync deduplicates concurrent probes for the same source.
@@ -407,36 +416,52 @@ public sealed class MediaSourceManagerDecorator(
             // all race to modify owner.Path on the same in-memory item.
             await _lock.RunSingleFlightAsync(owner.Id, async innerCt =>
             {
-                // Re-check after acquiring the token — a concurrent caller may have
-                // finished probing this source while we were waiting.
-                var recheck = GetStaticMediaSources(item, enablePathSubstitution, user);
-                if (SelectByIdOrFirst(recheck, mediaSourceId) is { } rec && !NeedsProbe(rec))
-                    return;
-                if (IsProbeOnCooldown(owner.Id))
-                    return;
-
-                var libraryOptions = _libraryManager.GetLibraryOptions(owner);
-                var segmentTask = _mediaSegmentManager.RunSegmentPluginProviders(
-                    owner,
-                    libraryOptions,
-                    false,
-                    innerCt
-                );
-                var probeTask = ProbeStreamAsync((Video)owner, selected.Path, innerCt);
-                await Task.WhenAll(probeTask, segmentTask).ConfigureAwait(false);
-
-                if (await probeTask)
+                // Wrap everything so the cooldown is guaranteed to be set on any
+                // failure path — including unexpected exceptions from helpers like
+                // GetStaticMediaSources or RunSegmentPluginProviders.
+                try
                 {
-                    await owner
-                        .UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, innerCt)
-                        .ConfigureAwait(false);
+                    // Re-check after acquiring the token — a concurrent caller may have
+                    // finished probing this source while we were waiting.
+                    var recheck = GetStaticMediaSources(item, enablePathSubstitution, user);
+                    if (SelectByIdOrFirst(recheck, mediaSourceId) is { } rec && !NeedsProbe(rec))
+                        return;
+                    if (IsProbeOnCooldown(owner.Id))
+                        return;
+
+                    var libraryOptions = _libraryManager.GetLibraryOptions(owner);
+                    var segmentTask = _mediaSegmentManager.RunSegmentPluginProviders(
+                        owner,
+                        libraryOptions,
+                        false,
+                        innerCt
+                    );
+
+                    // Cap probe time so a slow/unresponsive remote stream doesn't block
+                    // GetPostedPlaybackInfo for the full ffprobe network timeout (~60s).
+                    using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(innerCt);
+                    probeCts.CancelAfter(TimeSpan.FromSeconds(15));
+
+                    var probeTask = ProbeStreamAsync((Video)owner, selected.Path, probeCts.Token);
+                    await Task.WhenAll(probeTask, segmentTask).ConfigureAwait(false);
+
+                    if (await probeTask)
+                    {
+                        await owner
+                            .UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, innerCt)
+                            .ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        EnterProbeCooldown(owner.Id, manager, user.Id, item.Id);
+                    }
                 }
-                else
+                catch (Exception ex) when (!innerCt.IsCancellationRequested)
                 {
-                    // Probe failed (e.g. HTTP 403 from remote). Enter cooldown so we
-                    // don't re-probe this source for the next 10 minutes. A re-sync of
-                    // the stream list will clear stale URLs when the TTL expires.
-                    _probeCooldowns[owner.Id] = DateTime.UtcNow;
+                    // Unexpected failure — still enter cooldown to prevent an immediate
+                    // retry storm and force a fresh stream sync on the next play attempt.
+                    _log.LogWarning(ex, "Probe singleflight failed unexpectedly for {Id}", owner.Id);
+                    EnterProbeCooldown(owner.Id, manager, user.Id, item.Id);
                 }
             }, ct).ConfigureAwait(false);
 
@@ -812,14 +837,20 @@ public sealed class MediaSourceManagerDecorator(
             );
             return true;
         }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Probe-specific timeout fired (not the outer request cancellation).
+            _log.LogWarning("Stream probe timed out for {Id}", owner.Id);
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            // Outer request was cancelled — don't treat this as a probe failure.
+            throw;
+        }
         catch (Exception ex)
         {
-            _log.LogWarning(
-                ex,
-                "Stream probe failed for {Id} — entering {Mins}min cooldown",
-                owner.Id,
-                (int)_probeCooldownDuration.TotalMinutes
-            );
+            _log.LogWarning(ex, "Stream probe failed for {Id}", owner.Id);
             return false;
         }
         finally

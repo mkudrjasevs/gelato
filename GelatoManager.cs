@@ -66,6 +66,11 @@ public sealed class GelatoManager(
         return memoryCache.TryGetValue($"streamsync:{guid}", out _);
     }
 
+    public void ClearStreamSync(string guid)
+    {
+        memoryCache.Remove($"streamsync:{guid}");
+    }
+
     public void SaveStremioMeta(Guid guid, StremioMeta meta)
     {
         memoryCache.Set($"meta:{guid}", meta, TimeSpan.FromMinutes(360));
