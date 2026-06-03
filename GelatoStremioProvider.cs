@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using MediaBrowser.Controller.Entities;
@@ -42,6 +43,37 @@ public class GelatoStremioProvider(
         return c;
     }
 
+    // Circuit breaker: when the addon signals rate limiting (HTTP 429/503, or an HTML
+    // page returned in place of JSON), stop sending requests for a short window. This
+    // prevents Gelato's request bursts (library refresh, release-date sync, metadata
+    // providers) from making the rate limit worse and collapses the log spam to a
+    // single line per backoff window.
+    private static readonly TimeSpan BackoffDuration = TimeSpan.FromSeconds(60);
+    private long _backoffUntilTicks; // DateTime.UtcNow.Ticks; 0 = not backing off
+
+    private bool IsBackingOff() =>
+        System.Threading.Interlocked.Read(ref _backoffUntilTicks) > DateTime.UtcNow.Ticks;
+
+    private void EnterBackoff(string reason, string url, string? detail = null)
+    {
+        var until = DateTime.UtcNow.Add(BackoffDuration);
+        var prev = System.Threading.Interlocked.Exchange(ref _backoffUntilTicks, until.Ticks);
+        // Only log when transitioning into backoff (the previous window had expired or
+        // was never set), so concurrent failures don't each emit a line.
+        if (prev <= DateTime.UtcNow.Ticks)
+        {
+            log.LogWarning(
+                "Stremio addon at {BaseUrl} appears rate-limited or unavailable ({Reason}); "
+                    + "backing off for {Seconds}s. First failing request: {Url}{Detail}",
+                baseUrl,
+                reason,
+                (int)BackoffDuration.TotalSeconds,
+                url,
+                detail is null ? string.Empty : $" — body: {detail}"
+            );
+        }
+    }
+
     private string BuildUrl(string[] segments, IEnumerable<string>? extras = null)
     {
         var parts = segments.Select(Uri.EscapeDataString).ToArray();
@@ -61,6 +93,15 @@ public class GelatoStremioProvider(
 
     private async Task<T?> GetJsonAsync<T>(string url)
     {
+        // Fail fast while the addon is in a rate-limit backoff window. Returning null
+        // here means callers fall back to cached/empty data instead of generating more
+        // traffic against an addon that is already refusing us.
+        if (IsBackingOff())
+        {
+            log.LogDebug("GetJsonAsync: skipping {Url} — addon in rate-limit backoff", url);
+            return default;
+        }
+
         log.LogDebug("GetJsonAsync: requesting {Url}", url);
 
         try
@@ -70,6 +111,16 @@ public class GelatoStremioProvider(
 
             if (!resp.IsSuccessStatusCode)
             {
+                // Rate limiting / temporary unavailability → enter backoff and fail soft.
+                if (
+                    resp.StatusCode == HttpStatusCode.TooManyRequests
+                    || resp.StatusCode == HttpStatusCode.ServiceUnavailable
+                )
+                {
+                    EnterBackoff($"HTTP {(int)resp.StatusCode}", url);
+                    return default;
+                }
+
                 log.LogWarning(
                     "GetJsonAsync: request failed for {Url} with {StatusCode} {ReasonPhrase}",
                     url,
@@ -84,18 +135,17 @@ public class GelatoStremioProvider(
                 );
             }
 
-            // Guard against HTML error pages returned with a 200 status (e.g. captive
-            // portals, auth redirects, Nginx error pages). Without this check, the JSON
-            // parser throws a confusing "'<' is an invalid start of a value" error that
-            // gives no hint about what the server actually returned.
+            // Guard against HTML pages returned with a 200 status. AIOStreams (and similar
+            // addons) serve their HTML SPA — which renders a rate-limit message client-side
+            // — instead of JSON when throttling. Treat that as a rate-limit signal and back
+            // off, rather than letting the JSON parser throw a confusing error per request.
             var contentType = resp.Content.Headers.ContentType?.MediaType ?? string.Empty;
             if (!contentType.Contains("json", StringComparison.OrdinalIgnoreCase))
             {
                 var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
-                var snippet = body.Length > 300 ? body[..300] + "…" : body;
-                log.LogError(
-                    "GetJsonAsync: server returned {ContentType} instead of JSON for {Url} — body: {Snippet}",
-                    string.IsNullOrEmpty(contentType) ? "(no content-type)" : contentType,
+                var snippet = body.Length > 200 ? body[..200] + "…" : body;
+                EnterBackoff(
+                    $"non-JSON response ({(string.IsNullOrEmpty(contentType) ? "no content-type" : contentType)})",
                     url,
                     snippet
                 );
@@ -104,6 +154,13 @@ public class GelatoStremioProvider(
 
             await using var s = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
             return await JsonSerializer.DeserializeAsync<T>(s, JsonOpts).ConfigureAwait(false);
+        }
+        catch (JsonException ex)
+        {
+            // Malformed JSON (e.g. truncated/HTML body slipping past the content-type
+            // check). Don't spam a stack trace per item — back off and fail soft.
+            EnterBackoff("malformed JSON", url, ex.Message);
+            return default;
         }
         catch (Exception ex)
         {
