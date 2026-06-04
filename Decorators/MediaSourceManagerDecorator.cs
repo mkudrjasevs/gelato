@@ -460,6 +460,44 @@ public sealed class MediaSourceManagerDecorator(
 
         var cfg = GelatoPlugin.Instance!.GetConfig(userId);
 
+        var actionName = ctx?.GetActionName();
+        var isSetupAction = actionName is "GetPostedPlaybackInfo" or "GetPlaybackInfo";
+
+        // Warm the subtitle cache synchronously (capped) on playback setup so external-URL
+        // subtitle tracks are present on the FIRST play. Done here — which is reached only
+        // for playback, not for the fast detail/list DTO requests that also flow through
+        // GetStaticMediaSources — so it never stalls browsing.
+        if (
+            cfg.EnableExternalUrlSubtitles
+            && isSetupAction
+            && item.GetBaseItemKind() is BaseItemKind.Movie or BaseItemKind.Episode
+        )
+        {
+            try
+            {
+                var subUri = StremioUri.FromBaseItem(item);
+                if (
+                    subUri is not null
+                    && !_subtitleProvider.Value.TryGetCachedSubtitles(
+                        subUri.ExternalId,
+                        subUri.MediaType,
+                        out _
+                    )
+                )
+                {
+                    using var subCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    subCts.CancelAfter(TimeSpan.FromSeconds(4));
+                    await _subtitleProvider
+                        .Value.GetSubtitlesAsync(subUri.ExternalId, subUri.MediaType, subCts.Token)
+                        .ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                _log.LogDebug(ex, "Subtitle warm failed/timed out for {Id}", item.Id);
+            }
+        }
+
         var sources = GetStaticMediaSources(item, enablePathSubstitution, user);
 
         // Only honour a mediaSourceId that was explicitly supplied by the client.
@@ -479,9 +517,6 @@ public sealed class MediaSourceManagerDecorator(
             mediaSourceId
         );
 
-        // Compute action name early — used to gate probing and source trimming below.
-        var actionName = ctx?.GetActionName();
-
         // Identify the preferred source (explicit client choice, or first available).
         var selected = SelectByIdOrFirst(sources, mediaSourceId);
         if (selected is null)
@@ -495,13 +530,6 @@ public sealed class MediaSourceManagerDecorator(
             if (selected is null)
                 return sources;
         }
-
-        // Only probe on the initial playback setup request (GetPostedPlaybackInfo /
-        // GetPlaybackInfo). When seeking, the client calls GetHlsVideoSegment which
-        // also reaches GetPlaybackMediaSources. Re-probing there adds network latency
-        // before FFmpeg even starts, causing the client to time out. Exclude null so
-        // that calls from unknown/internal code paths don't accidentally probe.
-        var isSetupAction = actionName is "GetPostedPlaybackInfo" or "GetPlaybackInfo";
 
         // Compute intro/credit segments against the REAL playing item (the episode the
         // client requested), NOT the per-stream "owner" item. Jellyfin's clients query
@@ -965,6 +993,9 @@ public sealed class MediaSourceManagerDecorator(
         {
             try
             {
+                // Non-blocking cache read only — this method runs inside every
+                // GetStaticMediaSources call (incl. detail-page DTOs), so it must stay fast.
+                // The cache is warmed synchronously in GetPlaybackMediaSources before play.
                 var uri = StremioUri.FromBaseItem(playingItem);
                 if (
                     uri is not null

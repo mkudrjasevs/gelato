@@ -177,8 +177,14 @@ public static class StreamInfoParser
         var list = new List<MediaStream>(2);
         var idx = startIndex;
 
-        if (info.Height is not null || info.VideoCodec is not null)
+        if (info.Height is not null || info.VideoCodec is not null || info.VideoRange is not null)
         {
+            var vTitle = JoinNonEmpty(
+                " ",
+                info.ResolutionLabel,
+                info.VideoCodecLabel,
+                info.VideoRange
+            );
             list.Add(
                 new MediaStream
                 {
@@ -187,7 +193,7 @@ public static class StreamInfoParser
                     Codec = info.VideoCodec,
                     Width = info.Width,
                     Height = info.Height,
-                    Title = JoinNonEmpty(" ", info.ResolutionLabel, info.VideoCodecLabel, info.VideoRange),
+                    Title = string.IsNullOrEmpty(vTitle) ? null : vTitle,
                     IsDefault = true,
                 }
             );
@@ -236,13 +242,15 @@ public static class StreamInfoParser
         if (info.SizeBytes is { } b && b > 0)
             parts.Add(FormatSize(b));
 
+        // Use plain ASCII text rather than an emoji/bullet: some native clients (e.g.
+        // Neptune) render those glyphs as boxes or dashes.
         if (info.Cached)
-            parts.Add((info.DebridTag ?? string.Empty) + "⚡");
+            parts.Add(string.IsNullOrEmpty(info.DebridTag) ? "Cached" : info.DebridTag!);
 
         if (parts.Count == 0)
             return fallback ?? "Stream";
 
-        return string.Join(" • ", parts);
+        return string.Join(" | ", parts);
     }
 
     private static string? ChannelLabel(int? channels) =>
