@@ -389,6 +389,16 @@ public sealed class MediaSourceManagerDecorator(
         var manager = _manager.Value;
         var ctx = _http.HttpContext;
 
+        // Jellyfin can invoke GetPlaybackMediaSources with a null user on transcode /
+        // HLS-segment requests (the segment job isn't always associated with a user).
+        // Dereferencing user.Id directly then throws NullReferenceException right here in
+        // the method body, which the on-demand-sync catch swallowed — leaving no sources
+        // and producing FFmpeg "-i \"\"". Resolve an effective user id defensively from
+        // the request context instead, exactly as GetStaticMediaSources does.
+        var userId = user?.Id ?? Guid.Empty;
+        if (userId == Guid.Empty)
+            ctx.TryGetUserId(out userId);
+
         var sources = GetStaticMediaSources(item, enablePathSubstitution, user);
 
         // Only honour a mediaSourceId that was explicitly supplied by the client.
@@ -475,7 +485,7 @@ public sealed class MediaSourceManagerDecorator(
                     }
                     else
                     {
-                        EnterProbeCooldown(owner.Id, manager, user.Id, item.Id);
+                        EnterProbeCooldown(owner.Id, manager, userId, item.Id);
                     }
                 }
                 catch (Exception ex) when (!innerCt.IsCancellationRequested)
@@ -483,7 +493,7 @@ public sealed class MediaSourceManagerDecorator(
                     // Unexpected failure — still enter cooldown to prevent an immediate
                     // retry storm and force a fresh stream sync on the next play attempt.
                     _log.LogWarning(ex, "Probe singleflight failed unexpectedly for {Id}", owner.Id);
-                    EnterProbeCooldown(owner.Id, manager, user.Id, item.Id);
+                    EnterProbeCooldown(owner.Id, manager, userId, item.Id);
                 }
             }, ct).ConfigureAwait(false);
 
@@ -525,10 +535,10 @@ public sealed class MediaSourceManagerDecorator(
             // so the client gets actual sources instead of crashing Jellyfin.
             try
             {
-                var syncCount = await manager.SyncStreams(item, user.Id, ct).ConfigureAwait(false);
+                var syncCount = await manager.SyncStreams(item, userId, ct).ConfigureAwait(false);
                 if (syncCount > 0)
                 {
-                    manager.SetStreamSync($"{user.Id}:{item.Id}");
+                    manager.SetStreamSync($"{userId}:{item.Id}");
                     var fresh = GetStaticMediaSources(item, enablePathSubstitution, user);
                     withPath = fresh.Where(s => s is not null && !string.IsNullOrEmpty(s.Path)).ToList();
                 }
