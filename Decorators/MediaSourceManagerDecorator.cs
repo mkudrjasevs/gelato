@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using Gelato.Config;
 using Gelato.Providers;
 using Gelato.Services;
 using Jellyfin.Data;
@@ -280,15 +281,32 @@ public sealed class MediaSourceManagerDecorator(
             })
             .ToList();
 
+        static string? GetStr(Dictionary<string, JsonElement>? d, string key) =>
+            d != null && d.TryGetValue(key, out var el) && el.ValueKind == JsonValueKind.String
+                ? el.GetString()
+                : null;
+
         var gelatoSources = afterUserFilter
             .Select(t => (
                 t.Item,
                 t.Data,
+                // Parse the addon name/description/filename once per item: reused for the
+                // best-first sort key, the rich version name, and synthetic track badges.
+                Parsed: StreamInfoParser.Parse(
+                    GetStr(t.Data, "name"),
+                    GetStr(t.Data, "description"),
+                    GetStr(t.Data, "filename")
+                ),
                 SortIndex: t.Data != null && t.Data.TryGetValue("index", out var idx)
                     ? idx.Deserialize<int?>() ?? int.MaxValue
                     : int.MaxValue
             ))
-            .OrderBy(t => t.SortIndex)
+            // Best-first: cached/debrid-backed streams, then highest resolution, then the
+            // addon's original order. This makes the auto-selected source (sources[0]) the
+            // one most likely to direct-play, cutting down on version trial-and-error.
+            .OrderByDescending(t => cfg.EnableSmartVersionOrdering && t.Parsed.Cached)
+            .ThenByDescending(t => cfg.EnableSmartVersionOrdering ? (t.Parsed.Height ?? 0) : 0)
+            .ThenBy(t => t.SortIndex)
             .Select(t =>
             {
                 // Isolate per-stream failures: a single malformed stream item must not
@@ -297,7 +315,7 @@ public sealed class MediaSourceManagerDecorator(
                 // placeholder → FFmpeg "-i \"\"" → black screen). Skip + log instead.
                 try
                 {
-                    var k = GetVersionInfo(t.Item, MediaSourceType.Grouping, user, t.Data);
+                    var k = GetVersionInfo(t.Item, MediaSourceType.Grouping, user, t.Data, cfg, item, t.Parsed);
                     if (user is not null)
                         _inner.SetDefaultAudioAndSubtitleStreamIndices(item, k, user);
                     return k;
@@ -371,7 +389,14 @@ public sealed class MediaSourceManagerDecorator(
         // so Jellyfin shows the item but does not attempt to stream a broken URI.
         if (sources.Count == 0)
         {
-            var placeholder = GetVersionInfo(item, MediaSourceType.Placeholder, user);
+            var placeholder = GetVersionInfo(
+                item,
+                MediaSourceType.Placeholder,
+                user,
+                null,
+                cfg,
+                item
+            );
             placeholder.Path = null;
             sources.Add(placeholder);
         }
@@ -433,6 +458,8 @@ public sealed class MediaSourceManagerDecorator(
         if (userId == Guid.Empty)
             ctx.TryGetUserId(out userId);
 
+        var cfg = GelatoPlugin.Instance!.GetConfig(userId);
+
         var sources = GetStaticMediaSources(item, enablePathSubstitution, user);
 
         // Only honour a mediaSourceId that was explicitly supplied by the client.
@@ -475,6 +502,35 @@ public sealed class MediaSourceManagerDecorator(
         // before FFmpeg even starts, causing the client to time out. Exclude null so
         // that calls from unknown/internal code paths don't accidentally probe.
         var isSetupAction = actionName is "GetPostedPlaybackInfo" or "GetPlaybackInfo";
+
+        // Compute intro/credit segments against the REAL playing item (the episode the
+        // client requested), NOT the per-stream "owner" item. Jellyfin's clients query
+        // /MediaSegments using the played item's id, so segments must be persisted under
+        // that id — previously they were generated against the stream item and never
+        // found. This also runs independently of the probe gate, so "Skip Intro" works
+        // even when the source is already probed/cached. Capped so a slow IntroDB lookup
+        // can't stall playback setup.
+        if (cfg.EnableIntroSkip && isSetupAction && item is Episode)
+        {
+            try
+            {
+                using var segCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                segCts.CancelAfter(TimeSpan.FromSeconds(5));
+                await _mediaSegmentManager
+                    .RunSegmentPluginProviders(
+                        item,
+                        _libraryManager.GetLibraryOptions(item),
+                        false,
+                        segCts.Token
+                    )
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                _log.LogDebug(ex, "Intro segment computation failed/timed out for {Id}", item.Id);
+            }
+        }
+
         if (isSetupAction && NeedsProbe(selected) && !IsProbeOnCooldown(owner.Id))
         {
             // RunSingleFlightAsync deduplicates concurrent probes for the same source.
@@ -495,23 +551,15 @@ public sealed class MediaSourceManagerDecorator(
                     if (IsProbeOnCooldown(owner.Id))
                         return;
 
-                    var libraryOptions = _libraryManager.GetLibraryOptions(owner);
-                    var segmentTask = _mediaSegmentManager.RunSegmentPluginProviders(
-                        owner,
-                        libraryOptions,
-                        false,
-                        innerCt
-                    );
-
                     // Cap probe time so a slow/unresponsive remote stream doesn't block
                     // GetPostedPlaybackInfo for the full ffprobe network timeout (~60s).
                     using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(innerCt);
                     probeCts.CancelAfter(TimeSpan.FromSeconds(15));
 
-                    var probeTask = ProbeStreamAsync((Video)owner, selected.Path, probeCts.Token);
-                    await Task.WhenAll(probeTask, segmentTask).ConfigureAwait(false);
+                    var probed = await ProbeStreamAsync((Video)owner, selected.Path, probeCts.Token)
+                        .ConfigureAwait(false);
 
-                    if (await probeTask)
+                    if (probed)
                     {
                         await owner
                             .UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, innerCt)
@@ -720,10 +768,15 @@ public sealed class MediaSourceManagerDecorator(
         BaseItem item,
         MediaSourceType type,
         User? user = null,
-        Dictionary<string, JsonElement>? data = null
+        Dictionary<string, JsonElement>? data = null,
+        PluginConfiguration? cfg = null,
+        BaseItem? playingItem = null,
+        StreamInfoParser.ParsedStreamInfo? parsed = null
     )
     {
         ArgumentNullException.ThrowIfNull(item);
+
+        cfg ??= GelatoPlugin.Instance!.GetConfig(user?.Id ?? Guid.Empty);
 
         // Use pre-parsed ExternalId data when available (passed from the loop that
         // already called GetAllGelatoData); otherwise parse once here.
@@ -734,16 +787,23 @@ public sealed class MediaSourceManagerDecorator(
 
         var streamName = Get<string>(data, "name");
         var streamDesc = Get<string>(data, "description");
-        var richName = !string.IsNullOrEmpty(streamDesc)
-            ? $"{streamName}\n{streamDesc}"
-            : streamName;
+        var filename = Get<string>(data, "filename");
+
+        // Reuse the parsed info from the sort stage when provided; otherwise parse here.
+        var info0 = parsed ?? StreamInfoParser.Parse(streamName, streamDesc, filename);
+
+        // Native, compact version label ("1080p • HEVC • DDP 5.1 • 2.3 GB • RD⚡") when
+        // enabled, falling back to the raw addon name/description otherwise.
+        var richName = cfg.EnableRichSourceNames
+            ? StreamInfoParser.BuildSourceName(info0, streamName)
+            : (!string.IsNullOrEmpty(streamDesc) ? $"{streamName}\n{streamDesc}" : streamName);
 
         var info = new MediaSourceInfo
         {
             Id = item.Id.ToString("N", CultureInfo.InvariantCulture),
             ETag = item.Id.ToString("N", CultureInfo.InvariantCulture),
             Protocol = MediaProtocol.Http,
-            MediaStreams = GetMediaStreamsWithExternalSubs(item, Get<string>(data, "filename")),
+            MediaStreams = GetMediaStreamsWithExternalSubs(item, filename, info0, cfg, playingItem),
             // Gelato stream sources are HTTP streams — they never carry embedded
             // attachments (those are MKV-embedded fonts/cover art). Returning an empty
             // array avoids a per-stream DB round-trip that always returns nothing.
@@ -756,9 +816,10 @@ public sealed class MediaSourceManagerDecorator(
             Type = type,
             SupportsDirectStream = true,
             SupportsDirectPlay = true,
-            // just always say yes
-            HasSegments = true,
-            //HasSegments = MediaSegmentManager.HasSegments(item.Id)
+            // Only episodes can have intro segments (IntroDB is episode-only). Advertising
+            // segments for movies caused clients to query an endpoint that always returns
+            // nothing; episodes are now generated against the correct (played) item id.
+            HasSegments = item is Episode,
         };
 
 
@@ -821,63 +882,136 @@ public sealed class MediaSourceManagerDecorator(
     // metadata folder are never discovered during library refresh and never written to the DB.
     // We work around this by scanning the metadata folder ourselves at playback time and merging
     // any matching subtitle files into the DB streams on the fly.
-    private IReadOnlyList<MediaStream> GetMediaStreamsWithExternalSubs(BaseItem item, string? gelatoFilename)
+    private IReadOnlyList<MediaStream> GetMediaStreamsWithExternalSubs(
+        BaseItem item,
+        string? gelatoFilename,
+        StreamInfoParser.ParsedStreamInfo parsed,
+        PluginConfiguration cfg,
+        BaseItem? playingItem
+    )
     {
         var streams = _inner.GetMediaStreams(item.Id).ToList();
 
-        if (string.IsNullOrEmpty(gelatoFilename))
-            return streams;
+        // (A) Synthesize basic video/audio tracks from the addon's name/description/filename
+        // when the DB has no probed video stream, so clients (e.g. Neptune) show resolution/
+        // codec badges and an audio track entry BEFORE any probe runs. A later real probe
+        // writes proper streams to the DB, so this branch is skipped once probed.
+        if (cfg.EnableSyntheticStreams && streams.All(s => s.Type != MediaStreamType.Video))
+        {
+            var startIdx = streams.Count > 0 ? streams.Max(s => s.Index) + 1 : 0;
+            streams.AddRange(StreamInfoParser.ToMediaStreams(parsed, startIdx));
+        }
 
-        var metaPath = item.GetInternalMetadataPath();
-        if (!Directory.Exists(metaPath))
-            return streams;
-
-        var baseName = Path.GetFileNameWithoutExtension(gelatoFilename);
+        var nextIndex = streams.Count > 0 ? streams.Max(s => s.Index) + 1 : 0;
         var existingPaths = new HashSet<string>(
             streams.Where(s => s.Path != null).Select(s => s.Path!),
             StringComparer.OrdinalIgnoreCase
         );
+        var existingSubLangs = new HashSet<string>(
+            streams
+                .Where(s => s.Type == MediaStreamType.Subtitle && !string.IsNullOrEmpty(s.Language))
+                .Select(s => s.Language!),
+            StringComparer.OrdinalIgnoreCase
+        );
 
-        var nextIndex = streams.Count > 0 ? streams.Max(s => s.Index) + 1 : 0;
-
-        foreach (var file in Directory.EnumerateFiles(metaPath))
+        // Existing on-disk subtitle merge. Jellyfin's MediaInfoResolver bails on non-file
+        // protocol items (stream items have http:// paths), so external subtitle files saved
+        // to the internal metadata folder are never discovered. Scan and merge them here.
+        var metaPath = item.GetInternalMetadataPath();
+        if (!string.IsNullOrEmpty(gelatoFilename) && Directory.Exists(metaPath))
         {
-            var fname = Path.GetFileName(file);
+            var baseName = Path.GetFileNameWithoutExtension(gelatoFilename);
+            foreach (var file in Directory.EnumerateFiles(metaPath))
+            {
+                var fname = Path.GetFileName(file);
+                if (!fname.StartsWith(baseName + ".", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                var ext = Path.GetExtension(fname).TrimStart('.');
+                if (!_subtitleExtensions.Contains(ext))
+                    continue;
+                if (existingPaths.Contains(file))
+                    continue;
 
-            // Must start with baseName + "."
-            if (!fname.StartsWith(baseName + ".", StringComparison.OrdinalIgnoreCase))
-                continue;
+                var suffix = fname.Substring(baseName.Length + 1);
+                var parts = Path.GetFileNameWithoutExtension(suffix).Split('.');
+                var langCode = parts.Length > 0 ? parts[0] : "und";
 
-            var ext = Path.GetExtension(fname).TrimStart('.');
-            if (!_subtitleExtensions.Contains(ext))
-                continue;
+                streams.Add(
+                    new MediaStream
+                    {
+                        Type = MediaStreamType.Subtitle,
+                        IsExternal = true,
+                        IsExternalUrl = false,
+                        SupportsExternalStream = true,
+                        Path = file,
+                        Language = langCode,
+                        Codec = ext.ToLowerInvariant(),
+                        Index = nextIndex++,
+                        IsDefault = false,
+                        IsForced = false,
+                        IsHearingImpaired = false,
+                    }
+                );
+                existingPaths.Add(file);
+                existingSubLangs.Add(langCode);
+            }
+        }
 
-            if (existingPaths.Contains(file))
-                continue;
-
-            // Parse language from suffix: {baseName}.{lang}.{ext} or {baseName}.{lang}.{N}.{ext}
-            var suffix = fname.Substring(baseName.Length + 1); // everything after "baseName."
-            var parts = Path.GetFileNameWithoutExtension(suffix).Split('.');
-            var langCode = parts.Length > 0 ? parts[0] : "und";
-
-            streams.Add(
-                new MediaStream
+        // (B) Surface Stremio subtitles as native external-URL tracks. The client fetches
+        // them on demand through the /gelato/subtitle proxy, so they no longer depend on a
+        // pre-download race (the previous cause of slow/missing subs). Disk subs above take
+        // precedence (deduped by language); these fill in the rest from the cached list.
+        if (cfg.EnableExternalUrlSubtitles && playingItem is not null)
+        {
+            try
+            {
+                var uri = StremioUri.FromBaseItem(playingItem);
+                if (
+                    uri is not null
+                    && _subtitleProvider.Value.TryGetCachedSubtitles(
+                        uri.ExternalId,
+                        uri.MediaType,
+                        out var subs
+                    )
+                )
                 {
-                    Type = MediaStreamType.Subtitle,
-                    IsExternal = true,
-                    IsExternalUrl = false,
-                    SupportsExternalStream = true,
-                    Path = file,
-                    Language = langCode,
-                    Codec = ext.ToLowerInvariant(),
-                    Index = nextIndex++,
-                    IsDefault = false,
-                    IsForced = false,
-                    IsHearingImpaired = false,
-                }
-            );
+                    foreach (var s in subs)
+                    {
+                        var lang = s.TwoLetterISOLanguageName() ?? s.LangCode ?? s.Lang ?? "und";
+                        if (!existingSubLangs.Add(lang))
+                            continue; // already have this language from disk or DB
+                        if (string.IsNullOrWhiteSpace(s.Id) || string.IsNullOrWhiteSpace(s.Url))
+                            continue;
 
-            existingPaths.Add(file);
+                        var codec = _subtitleProvider.Value.GuessSubtitleCodec(s.Url);
+                        streams.Add(
+                            new MediaStream
+                            {
+                                Type = MediaStreamType.Subtitle,
+                                IsExternal = true,
+                                IsExternalUrl = true,
+                                SupportsExternalStream = true,
+                                DeliveryMethod = SubtitleDeliveryMethod.External,
+                                DeliveryUrl =
+                                    $"/gelato/subtitle?id={Uri.EscapeDataString(s.Id)}&ext={codec}",
+                                Path = s.Url,
+                                Language = lang,
+                                Codec = codec,
+                                Title = string.IsNullOrEmpty(s.Title)
+                                    ? null
+                                    : Uri.UnescapeDataString(s.Title!),
+                                Index = nextIndex++,
+                                IsForced = false,
+                                IsHearingImpaired = false,
+                            }
+                        );
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "External-url subtitle merge failed for {Id}", playingItem.Id);
+            }
         }
 
         return streams;

@@ -84,6 +84,33 @@ namespace Gelato.Providers
             return subs;
         }
 
+        /// <summary>
+        /// Non-blocking read of the cached subtitle list (populated by the playback-time
+        /// prewarm or a prior <see cref="GetSubtitlesAsync"/>). Used to surface subtitles
+        /// as native external-URL tracks without a blocking network call.
+        /// </summary>
+        public bool TryGetCachedSubtitles(
+            string id,
+            StremioMediaType mediaType,
+            out IReadOnlyList<StremioSubtitle> subtitles
+        )
+        {
+            if (
+                _cache.TryGetValue(
+                    ListCacheKey(id, mediaType),
+                    out IReadOnlyList<StremioSubtitle>? cached
+                )
+                && cached is not null
+            )
+            {
+                subtitles = cached;
+                return true;
+            }
+
+            subtitles = Array.Empty<StremioSubtitle>();
+            return false;
+        }
+
         public async Task<IEnumerable<RemoteSubtitleInfo>> Search(
             SubtitleSearchRequest request,
             CancellationToken cancellationToken

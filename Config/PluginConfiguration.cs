@@ -28,6 +28,13 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool DisableSearch { get; set; } = false;
     public bool EnableJavaScriptInjection { get; set; } = false;
     public bool LazyImages { get; set; } = false;
+
+    // Native playback experience toggles.
+    public bool EnableIntroSkip { get; set; } = true;
+    public bool EnableSyntheticStreams { get; set; } = true;
+    public bool EnableExternalUrlSubtitles { get; set; } = true;
+    public bool EnableSmartVersionOrdering { get; set; } = true;
+    public bool EnableRichSourceNames { get; set; } = true;
     public List<CatalogConfig> Catalogs { get; set; } = [];
     public List<UserConfig> UserConfigs { get; set; } = [];
 
@@ -101,6 +108,11 @@ public class UserConfig
             MaxCollectionItems = baseConfig.MaxCollectionItems,
             EnableJavaScriptInjection = baseConfig.EnableJavaScriptInjection,
             LazyImages = baseConfig.LazyImages,
+            EnableIntroSkip = baseConfig.EnableIntroSkip,
+            EnableSyntheticStreams = baseConfig.EnableSyntheticStreams,
+            EnableExternalUrlSubtitles = baseConfig.EnableExternalUrlSubtitles,
+            EnableSmartVersionOrdering = baseConfig.EnableSmartVersionOrdering,
+            EnableRichSourceNames = baseConfig.EnableRichSourceNames,
             Catalogs = baseConfig.Catalogs,
             UserConfigs = baseConfig.UserConfigs,
         };
