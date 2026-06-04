@@ -173,8 +173,12 @@ public sealed class DtoServiceDecorator(IDtoService inner, Lazy<GelatoManager> m
                 isList
                 || dto.MediaSources?.Length != 1
                 || dto.Path is null
-                || !dto.MediaSources[0]
-                    .Path.StartsWith("gelato", StringComparison.OrdinalIgnoreCase)
+                || !(
+                    dto.MediaSources[0].Path?.StartsWith(
+                        "gelato",
+                        StringComparison.OrdinalIgnoreCase
+                    ) ?? false
+                )
             )
             {
                 if (dto.MediaSources != null)
