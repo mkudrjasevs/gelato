@@ -225,18 +225,47 @@ public sealed class MediaSourceManagerDecorator(
         if (item.GetBaseItemKind() == BaseItemKind.Episode)
         {
             var episode = (Episode)item;
-            query = new InternalItemsQuery
+
+            // Match stream items by the Stremio id (imdb:S:E — unique per episode and the
+            // exact key SyncStreams persists), NOT by ParentId+IndexNumber. A library/search
+            // reindex can recreate the Season with a new GUID, orphaning the stream items'
+            // ParentId so the old query returned 0 rows ("No usable gelato source … rawQuery=0")
+            // and playback fell through to FFmpeg "-i \"\"". The Stremio id survives reindexes.
+            var epStremioId = uri?.ExternalId;
+            if (!string.IsNullOrEmpty(epStremioId))
             {
-                IncludeItemTypes = [item.GetBaseItemKind()],
-                ParentId = episode.SeasonId,
-                Recursive = false,
-                GroupByPresentationUniqueKey = false,
-                GroupBySeriesPresentationUniqueKey = false,
-                CollapseBoxSetItems = false,
-                IsDeadPerson = true,
-                Tags = [GelatoManager.StreamTag],
-                IndexNumber = episode.IndexNumber,
-            };
+                query = new InternalItemsQuery
+                {
+                    IncludeItemTypes = [item.GetBaseItemKind()],
+                    HasAnyProviderId = new Dictionary<string, string>
+                    {
+                        { "Stremio", epStremioId! },
+                    },
+                    Recursive = true,
+                    GroupByPresentationUniqueKey = false,
+                    GroupBySeriesPresentationUniqueKey = false,
+                    CollapseBoxSetItems = false,
+                    IsDeadPerson = true,
+                    Tags = [GelatoManager.StreamTag],
+                };
+            }
+            else
+            {
+                // Fallback when the Stremio id can't be resolved (missing series imdb /
+                // season / episode number): the original parent-based lookup.
+                query = new InternalItemsQuery
+                {
+                    IncludeItemTypes = [item.GetBaseItemKind()],
+                    ParentId = episode.SeasonId,
+                    Recursive = false,
+                    GroupByPresentationUniqueKey = false,
+                    GroupBySeriesPresentationUniqueKey = false,
+                    CollapseBoxSetItems = false,
+                    IsDeadPerson = true,
+                    Tags = [GelatoManager.StreamTag],
+                    IndexNumber = episode.IndexNumber,
+                };
+            }
         }
         else
         {
