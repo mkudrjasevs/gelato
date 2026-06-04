@@ -120,48 +120,6 @@
               <div class="fieldDescription">Items released within these many days will be hidden if filter is enabled.
               </div>
             </div>
-
-            <h3 class="sectionTitle" style="margin-top: 1em;">Native playback</h3>
-
-            <div class="checkboxContainer checkboxContainer-withDescription">
-              <label>
-                <input is="emby-checkbox" type="checkbox" id="chkEnableSmartVersionOrdering" />
-                <span>Smart version ordering</span>
-              </label>
-              <div class="fieldDescription">Order stream versions best-first (cached/debrid and highest resolution), so the auto-selected one is most likely to play.</div>
-            </div>
-
-            <div class="checkboxContainer checkboxContainer-withDescription">
-              <label>
-                <input is="emby-checkbox" type="checkbox" id="chkEnableRichSourceNames" />
-                <span>Rich version names</span>
-              </label>
-              <div class="fieldDescription">Show compact native labels (e.g. "1080p • HEVC • DDP 5.1 • 2.3 GB").</div>
-            </div>
-
-            <div class="checkboxContainer checkboxContainer-withDescription">
-              <label>
-                <input is="emby-checkbox" type="checkbox" id="chkEnableSyntheticStreams" />
-                <span>Show quality/track badges before probe</span>
-              </label>
-              <div class="fieldDescription">Infer resolution/codec/audio tracks from the addon's stream info so clients show badges and track selectors without waiting for a probe.</div>
-            </div>
-
-            <div class="checkboxContainer checkboxContainer-withDescription">
-              <label>
-                <input is="emby-checkbox" type="checkbox" id="chkEnableExternalUrlSubtitles" />
-                <span>On-demand external subtitles</span>
-              </label>
-              <div class="fieldDescription">Surface Stremio subtitles as external-URL tracks fetched on demand, instead of relying on a pre-download (fixes slow/missing subs).</div>
-            </div>
-
-            <div class="checkboxContainer checkboxContainer-withDescription">
-              <label>
-                <input is="emby-checkbox" type="checkbox" id="chkEnableIntroSkip" />
-                <span>Intro skipping (IntroDB)</span>
-              </label>
-              <div class="fieldDescription">Look up and expose intro segments for episodes so the "Skip Intro" button appears.</div>
-            </div>
           </div>
 
           <!-- Catalogs Tab -->
@@ -342,11 +300,6 @@
         const txtFFmpegProbeSize = page.querySelector('#txtFFmpegProbeSize');
         const chkEnableJavaScriptInjection = page.querySelector('#chkEnableJavaScriptInjection');
         const chkLazyImages = page.querySelector('#chkLazyImages');
-        const chkEnableSmartVersionOrdering = page.querySelector('#chkEnableSmartVersionOrdering');
-        const chkEnableRichSourceNames = page.querySelector('#chkEnableRichSourceNames');
-        const chkEnableSyntheticStreams = page.querySelector('#chkEnableSyntheticStreams');
-        const chkEnableExternalUrlSubtitles = page.querySelector('#chkEnableExternalUrlSubtitles');
-        const chkEnableIntroSkip = page.querySelector('#chkEnableIntroSkip');
 
         // Catalogs
         const catalogsList = page.querySelector('#catalogsList');
@@ -641,11 +594,6 @@
             if (txtFFmpegProbeSize) txtFFmpegProbeSize.value = cfg.FFmpegProbeSize || "25M";
             if (chkEnableJavaScriptInjection) chkEnableJavaScriptInjection.checked = cfg.EnableJavaScriptInjection || false;
             if (chkLazyImages) chkLazyImages.checked = cfg.LazyImages ?? false;
-            if (chkEnableSmartVersionOrdering) chkEnableSmartVersionOrdering.checked = cfg.EnableSmartVersionOrdering ?? true;
-            if (chkEnableRichSourceNames) chkEnableRichSourceNames.checked = cfg.EnableRichSourceNames ?? true;
-            if (chkEnableSyntheticStreams) chkEnableSyntheticStreams.checked = cfg.EnableSyntheticStreams ?? true;
-            if (chkEnableExternalUrlSubtitles) chkEnableExternalUrlSubtitles.checked = cfg.EnableExternalUrlSubtitles ?? true;
-            if (chkEnableIntroSkip) chkEnableIntroSkip.checked = cfg.EnableIntroSkip ?? true;
 
             // User Overrides Logic
             await loadUsers();
@@ -681,11 +629,6 @@
             cfg.FFmpegProbeSize = txtFFmpegProbeSize.value;
             cfg.EnableJavaScriptInjection = chkEnableJavaScriptInjection.checked;
             cfg.LazyImages = chkLazyImages.checked;
-            if (chkEnableSmartVersionOrdering) cfg.EnableSmartVersionOrdering = chkEnableSmartVersionOrdering.checked;
-            if (chkEnableRichSourceNames) cfg.EnableRichSourceNames = chkEnableRichSourceNames.checked;
-            if (chkEnableSyntheticStreams) cfg.EnableSyntheticStreams = chkEnableSyntheticStreams.checked;
-            if (chkEnableExternalUrlSubtitles) cfg.EnableExternalUrlSubtitles = chkEnableExternalUrlSubtitles.checked;
-            if (chkEnableIntroSkip) cfg.EnableIntroSkip = chkEnableIntroSkip.checked;
 
             // Only collect catalog states if catalogs have been loaded (i.e., if we're on catalogs tab or it was loaded)
             if (allCatalogs.length > 0) {

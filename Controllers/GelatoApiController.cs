@@ -18,57 +18,18 @@ public sealed class GelatoApiController : ControllerBase
 {
     private readonly ILogger<GelatoApiController> _log;
     private readonly GelatoManager _gelatoManager;
-    private readonly Gelato.Providers.SubtitleProvider _subtitleProvider;
     private readonly string _downloadPath;
 
     public GelatoApiController(
         ILogger<GelatoApiController> log,
         IApplicationPaths appPaths,
-        GelatoManager gelatoManager,
-        Gelato.Providers.SubtitleProvider subtitleProvider
+        GelatoManager gelatoManager
     )
     {
         _log = log;
         _gelatoManager = gelatoManager;
-        _subtitleProvider = subtitleProvider;
         _downloadPath = Path.Combine(appPaths.CachePath, "gelato-torrents");
         Directory.CreateDirectory(_downloadPath);
-    }
-
-    /// <summary>
-    /// Proxies a Stremio subtitle by its addon id, downloading it on demand. Referenced as
-    /// the DeliveryUrl of external-URL subtitle tracks so clients fetch subs lazily instead
-    /// of relying on a pre-download into the metadata folder.
-    /// </summary>
-    [HttpGet("subtitle")]
-    public async Task<IActionResult> GetSubtitleProxy(
-        [FromQuery, Required] string id,
-        [FromQuery] string? ext
-    )
-    {
-        try
-        {
-            var resp = await _subtitleProvider.GetSubtitles(
-                id,
-                HttpContext.RequestAborted
-            );
-            var contentType = (ext ?? resp.Format ?? "srt").ToLowerInvariant() switch
-            {
-                "vtt" => "text/vtt",
-                "ass" or "ssa" => "text/x-ssa",
-                _ => "application/x-subrip",
-            };
-            return File(resp.Stream, contentType);
-        }
-        catch (FileNotFoundException)
-        {
-            return NotFound();
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "Subtitle proxy failed for id={Id}", id);
-            return NotFound();
-        }
     }
 
     [HttpGet("meta/{stremioMetaType}/{Id}")]
