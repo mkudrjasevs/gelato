@@ -263,10 +263,14 @@ public sealed class MediaSourceManagerDecorator(
         //
         // Sort key is extracted into a named tuple field BEFORE OrderBy so the
         // comparison-based sort doesn't re-invoke GetAllGelatoData O(N log N) times.
-        var gelatoSources = repo.GetItemList(query)
-            .OfType<Video>()
+        // Materialize each pipeline stage so we can pinpoint where streams are lost
+        // when playback ends up with no usable path (FFmpeg "-i \"\"").
+        var rawRows = repo.GetItemList(query).OfType<Video>().ToList();
+        var gelatoItems = rawRows
             .Where(x => x.IsGelato())
             .Select(x => (Item: x, Data: x.GetAllGelatoData()))
+            .ToList();
+        var afterUserFilter = gelatoItems
             .Where(t =>
             {
                 if (userId == Guid.Empty) return true;
@@ -274,6 +278,9 @@ public sealed class MediaSourceManagerDecorator(
                 if (!t.Data.TryGetValue("userIds", out var u)) return false;
                 return u.Deserialize<List<Guid>>()?.Contains(userId) ?? false;
             })
+            .ToList();
+
+        var gelatoSources = afterUserFilter
             .Select(t => (
                 t.Item,
                 t.Data,
@@ -309,6 +316,33 @@ public sealed class MediaSourceManagerDecorator(
             .Where(k => k is not null)
             .Select(k => k!)
             .ToList();
+
+        // Diagnostic: if we found no usable (non-empty-path) gelato source, log the full
+        // breakdown so we can see exactly which stage dropped the stream — the repo query,
+        // the per-user filter, or version-info producing an empty Path.
+        if (!gelatoSources.Any(s => !string.IsNullOrEmpty(s.Path)))
+        {
+            _log.LogWarning(
+                "No usable gelato source for {ItemId} kind={Kind} seasonId={SeasonId} index={Index} "
+                    + "userId={UserId}: rawQuery={Raw} afterIsGelato={G} afterUserFilter={U} built={Built}; "
+                    + "rawPaths=[{RawPaths}]",
+                item.Id,
+                item.GetBaseItemKind(),
+                (item as Episode)?.SeasonId,
+                (item as Episode)?.IndexNumber,
+                userId,
+                rawRows.Count,
+                gelatoItems.Count,
+                afterUserFilter.Count,
+                gelatoSources.Count,
+                string.Join(
+                    " | ",
+                    afterUserFilter.Select(t =>
+                        $"id={t.Item.Id:N} path='{t.Item.Path}' shortcut={(t.Item as Video)?.IsShortcut} shortcutPath='{(t.Item as Video)?.ShortcutPath}'"
+                    )
+                )
+            );
+        }
 
         _log.LogDebug(
             "Found {s} streams. UserId={Action} GelatoId={Uri}",
@@ -735,10 +769,6 @@ public sealed class MediaSourceManagerDecorator(
             );
             info.SupportsDirectStream = user.HasPermission(PermissionKind.EnablePlaybackRemuxing);
         }
-        if (string.IsNullOrEmpty(info.Path))
-        {
-            info.Type = MediaSourceType.Placeholder;
-        }
 
         if (item is Video video)
         {
@@ -748,11 +778,23 @@ public sealed class MediaSourceManagerDecorator(
             info.Timestamp = video.Timestamp;
             info.IsRemote = true;
 
-            if (video.IsShortcut)
+            // Only adopt the shortcut path when it actually has a value. A stream item
+            // can be left with IsShortcut=true but an empty ShortcutPath (e.g. after a
+            // probe), and unconditionally assigning it would wipe out the real Path,
+            // yielding a pathless source that becomes FFmpeg "-i \"\"".
+            if (video.IsShortcut && !string.IsNullOrEmpty(video.ShortcutPath))
             {
                 info.IsRemote = true;
                 info.Path = video.ShortcutPath;
             }
+        }
+
+        // Re-evaluate placeholder status AFTER any Path adjustments above, so a source
+        // that ended up without a path is correctly typed as a Placeholder (and thus
+        // filtered out on the playback path) rather than handed to FFmpeg empty.
+        if (string.IsNullOrEmpty(info.Path))
+        {
+            info.Type = MediaSourceType.Placeholder;
         }
 
         info.Bitrate = item.TotalBitrate;
