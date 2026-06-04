@@ -208,9 +208,12 @@ public sealed class MediaSourceManagerDecorator(
         var sources = _inner
             .GetStaticMediaSources(item, enablePathSubstitution, user)
             .Where(k =>
-                string.IsNullOrEmpty(k.Path)
-                || (!k.Path.StartsWith("gelato://", StringComparison.OrdinalIgnoreCase)
-                    && !k.Path.StartsWith("stremio://", StringComparison.OrdinalIgnoreCase))
+                k is not null
+                && (
+                    string.IsNullOrEmpty(k.Path)
+                    || (!k.Path.StartsWith("gelato://", StringComparison.OrdinalIgnoreCase)
+                        && !k.Path.StartsWith("stremio://", StringComparison.OrdinalIgnoreCase))
+                )
             )
             .ToList();
 
@@ -281,11 +284,30 @@ public sealed class MediaSourceManagerDecorator(
             .OrderBy(t => t.SortIndex)
             .Select(t =>
             {
-                var k = GetVersionInfo(t.Item, MediaSourceType.Grouping, user, t.Data);
-                if (user is not null)
-                    _inner.SetDefaultAudioAndSubtitleStreamIndices(item, k, user);
-                return k;
+                // Isolate per-stream failures: a single malformed stream item must not
+                // throw out of GetStaticMediaSources (which would either 500 the detail
+                // request or, on the playback path, leave us with only the null-path
+                // placeholder → FFmpeg "-i \"\"" → black screen). Skip + log instead.
+                try
+                {
+                    var k = GetVersionInfo(t.Item, MediaSourceType.Grouping, user, t.Data);
+                    if (user is not null)
+                        _inner.SetDefaultAudioAndSubtitleStreamIndices(item, k, user);
+                    return k;
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(
+                        ex,
+                        "Failed to build version info for stream {StreamId} (item {ItemId})",
+                        t.Item.Id,
+                        item.Id
+                    );
+                    return null;
+                }
             })
+            .Where(k => k is not null)
+            .Select(k => k!)
             .ToList();
 
         _log.LogDebug(
@@ -496,7 +518,7 @@ public sealed class MediaSourceManagerDecorator(
         // Strip placeholder sources that have no path. A null-path source with
         // IsRemote=true causes ArgumentNullException inside Jellyfin's
         // GetStaticRemoteStreamResult when the client tries to stream it directly.
-        var withPath = ordered.Where(s => !string.IsNullOrEmpty(s.Path)).ToList();
+        var withPath = ordered.Where(s => s is not null && !string.IsNullOrEmpty(s.Path)).ToList();
         if (withPath.Count == 0 && ordered.Count > 0)
         {
             // No real streams available yet — attempt a blocking on-demand sync
@@ -508,7 +530,7 @@ public sealed class MediaSourceManagerDecorator(
                 {
                     manager.SetStreamSync($"{user.Id}:{item.Id}");
                     var fresh = GetStaticMediaSources(item, enablePathSubstitution, user);
-                    withPath = fresh.Where(s => !string.IsNullOrEmpty(s.Path)).ToList();
+                    withPath = fresh.Where(s => s is not null && !string.IsNullOrEmpty(s.Path)).ToList();
                 }
             }
             catch (Exception ex)
