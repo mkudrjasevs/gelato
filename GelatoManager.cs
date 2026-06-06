@@ -541,6 +541,11 @@ public sealed class GelatoManager(
             streamItem.PremiereDate = video.PremiereDate;
             streamItem.Path = path;
             streamItem.IsVirtualItem = false;
+            // Gelato streams are plain HTTP URLs, never shortcuts. Force these off in case a
+            // previous failed probe persisted IsShortcut=true / a stale ShortcutPath on this
+            // row: GetVersionInfo would otherwise resolve an empty path -> FFmpeg "-i \"\"".
+            streamItem.IsShortcut = false;
+            streamItem.ShortcutPath = null;
             streamItem.SetParent(parent);
 
             var users = streamItem.GelatoData<List<Guid>>("userIds") ?? [];

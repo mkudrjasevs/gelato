@@ -748,7 +748,14 @@ public sealed class MediaSourceManagerDecorator(
             info.Timestamp = video.Timestamp;
             info.IsRemote = true;
 
-            if (video.IsShortcut)
+            // Only adopt ShortcutPath when it is actually set. A failed probe can leave a
+            // stream row persisted with IsShortcut=true but a null ShortcutPath (the probe
+            // streams via a temporary .strm written to Path, then fails before restoring).
+            // Blindly copying ShortcutPath here would null out the path, and on the
+            // transcode path that becomes FFmpeg "-i \"\"" (exit 254). Gelato streams are
+            // plain HTTP URLs, never real shortcuts, so keep the already-assigned item.Path
+            // (the live stream URL) whenever ShortcutPath is empty.
+            if (video.IsShortcut && !string.IsNullOrEmpty(video.ShortcutPath))
             {
                 info.IsRemote = true;
                 info.Path = video.ShortcutPath;
