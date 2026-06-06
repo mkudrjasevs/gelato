@@ -15,13 +15,6 @@ public sealed class DtoServiceDecorator(IDtoService inner, Lazy<GelatoManager> m
 {
     private readonly Lazy<GelatoManager> _manager = manager;
     private readonly IHttpContextAccessor _http = http;
-    private const int PrefetchLimit = 10;
-
-    // Global cap on concurrent background stream prefetches across all in-flight list
-    // responses. Without this, a home-screen load (5-6 concurrent list requests, each
-    // with its own per-call semaphore) saturates the thread pool with 15-20 simultaneous
-    // SyncStreams calls. Items that can't acquire a slot are skipped and loaded on-demand.
-    private static readonly SemaphoreSlim _globalPrefetchThrottle = new(4, 4);
 
     public double? GetPrimaryImageAspectRatio(BaseItem item) =>
         inner.GetPrimaryImageAspectRatio(item);
@@ -67,64 +60,16 @@ public sealed class DtoServiceDecorator(IDtoService inner, Lazy<GelatoManager> m
 
         var list = inner.GetBaseItemDtos(items, options, user, owner);
 
-        // Pre-warm stream cache in the background so that by the time the user
-        // opens an item from this list, streams are already loaded and the detail
-        // page opens instantly instead of waiting on the Stremio addon.
-        if (user != null && _http.HttpContext?.IsApiListing() == true)
-        {
-            PrefetchStreamsInBackground(items, user.Id);
-        }
+        // No stream prefetch on list/browse responses: streams are synced only when an
+        // item's detail page is opened or playback starts (see InsertActionFilter /
+        // MediaSourceManagerDecorator). Browsing a library, home screen, show or season
+        // just returns the already-stored item metadata.
 
         foreach (var itemDto in list)
         {
             Patch(itemDto, item, true, user);
         }
         return list;
-    }
-
-    private void PrefetchStreamsInBackground(IReadOnlyList<BaseItem> items, Guid userId)
-    {
-        var manager = _manager.Value;
-
-        var toPrefetch = items
-            .Where(i =>
-                i.IsGelato()
-                && i.GetBaseItemKind() is BaseItemKind.Movie or BaseItemKind.Episode
-                && !manager.HasStreamSync($"{userId}:{i.Id}")
-            )
-            .Take(PrefetchLimit)
-            .ToList();
-
-        if (toPrefetch.Count == 0)
-            return;
-
-        _ = Task.Run(async () =>
-        {
-            var tasks = toPrefetch.Select(async baseItem =>
-            {
-                // Non-blocking: if the global prefetch limit is already saturated
-                // (another list response is running concurrent prefetches), skip
-                // this item. It will be synced on-demand when the user opens it.
-                if (!await _globalPrefetchThrottle.WaitAsync(TimeSpan.Zero).ConfigureAwait(false))
-                    return;
-                try
-                {
-                    var count = await manager
-                        .SyncStreams(baseItem, userId, CancellationToken.None)
-                        .ConfigureAwait(false);
-
-                    if (count > 0)
-                        manager.SetStreamSync($"{userId}:{baseItem.Id}");
-                }
-                catch { }
-                finally
-                {
-                    _globalPrefetchThrottle.Release();
-                }
-            });
-
-            await Task.WhenAll(tasks).ConfigureAwait(false);
-        });
     }
 
     public BaseItemDto GetItemByNameDto(

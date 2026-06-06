@@ -25,19 +25,9 @@ public class InsertActionFilter(
     {
         var ct = ctx.HttpContext.RequestAborted;
 
-        // Season-level blocking stream sync: when a client opens a season's episode
-        // list, load streams for every episode in that season before responding so
-        // that version selectors are immediately populated.
-        if (
-            ctx.GetActionName() == "GetEpisodes"
-            && ctx.TryGetUserId(out var seasonUserId)
-            && seasonUserId != Guid.Empty
-        )
-        {
-            await SyncSeasonStreamsAsync(ctx, seasonUserId, ct).ConfigureAwait(false);
-            await next();
-            return;
-        }
+        // NOTE: no season-level stream sync here. Browsing a season's episode list returns
+        // episode metadata only; a given episode's streams are synced when its detail page
+        // is opened or playback starts (single-item path below / MediaSourceManagerDecorator).
 
         if (
             !ctx.IsInsertableAction()
@@ -148,63 +138,6 @@ public class InsertActionFilter(
         {
             log.LogError(ex, "Stream sync failed for {Id}", item.Id);
         }
-    }
-
-    // Sync streams for every episode in a season, blocking the response until all
-    // are done. Runs up to 5 concurrent Stremio requests to keep it fast without
-    // hammering the addon.
-    private async Task SyncSeasonStreamsAsync(ActionExecutingContext ctx, Guid userId, CancellationToken ct)
-    {
-        var query = ctx.HttpContext.Request.Query;
-
-        if (
-            !query.TryGetValue("seasonId", out var seasonIdRaw)
-            || !Guid.TryParse(seasonIdRaw, out var seasonId)
-        )
-            return;
-
-        var episodes = libraryManager
-            .GetItemList(new InternalItemsQuery
-            {
-                ParentId = seasonId,
-                IncludeItemTypes = [BaseItemKind.Episode],
-                IsDeadPerson = true,
-            })
-            .OfType<Episode>()
-            .Where(e => e.IsGelato() && !e.IsStream() && !manager.HasStreamSync($"{userId}:{e.Id}"))
-            .ToList();
-
-        if (episodes.Count == 0)
-            return;
-
-        log.LogInformation(
-            "Blocking season sync: {Count} episode(s) in season {SeasonId} need stream sync",
-            episodes.Count,
-            seasonId
-        );
-
-        using var throttle = new SemaphoreSlim(5, 5);
-
-        var tasks = episodes.Select(async ep =>
-        {
-            await throttle.WaitAsync(ct).ConfigureAwait(false);
-            try
-            {
-                var count = await manager.SyncStreams(ep, userId, ct).ConfigureAwait(false);
-                if (count > 0)
-                    manager.SetStreamSync($"{userId}:{ep.Id}");
-            }
-            catch (Exception ex)
-            {
-                log.LogError(ex, "Stream sync failed for episode {Id}", ep.Id);
-            }
-            finally
-            {
-                throttle.Release();
-            }
-        });
-
-        await Task.WhenAll(tasks).ConfigureAwait(false);
     }
 
     private async Task HandleLocalSeriesAsync(Guid userId, Series series, CancellationToken ct)
