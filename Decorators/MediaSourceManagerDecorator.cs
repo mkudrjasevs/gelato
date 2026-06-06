@@ -319,6 +319,74 @@ public sealed class MediaSourceManagerDecorator(
 
         sources.AddRange(gelatoSources);
 
+        // Detail-view audio/subtitle pickers are read by clients (e.g. Neptune) from the
+        // item DTO's MediaStreams — which only exist once a source has been probed. Unlike
+        // the playback path, GetStaticMediaSources never probes, so on a fresh item the
+        // detail page shows only the version picker and NO track choices until the user
+        // plays once and re-opens it. When this call is serving an item-detail fetch,
+        // probe the default source synchronously so tracks are present on the FIRST open.
+        // Already-probed sources (those with a Video stream) are skipped, so this only
+        // costs latency the first time a given item is opened.
+        var isDetailFetch =
+            actionName is "GetItem" or "GetItemLegacy"
+            || (actionName == "GetItems" && ctx?.IsSingleItemList() == true);
+        if (isDetailFetch && gelatoSources.Count > 0)
+        {
+            var def = gelatoSources[0];
+            var defOwnerId = Guid.TryParse(def.ETag, out var dg) ? dg : Guid.Empty;
+            var needsProbe =
+                defOwnerId != Guid.Empty
+                && !string.IsNullOrEmpty(def.Path)
+                && (def.MediaStreams?.All(ms => ms.Type != MediaStreamType.Video) ?? true)
+                && !IsProbeOnCooldown(defOwnerId);
+
+            if (needsProbe && libraryManager.GetItemById(defOwnerId) is Video defOwner)
+            {
+                try
+                {
+                    _lock
+                        .RunSingleFlightAsync(
+                            defOwnerId,
+                            async innerCt =>
+                            {
+                                using var probeCts =
+                                    CancellationTokenSource.CreateLinkedTokenSource(innerCt);
+                                probeCts.CancelAfter(TimeSpan.FromSeconds(15));
+                                if (
+                                    await ProbeStreamAsync(defOwner, def.Path!, probeCts.Token)
+                                        .ConfigureAwait(false)
+                                )
+                                {
+                                    await defOwner
+                                        .UpdateToRepositoryAsync(
+                                            ItemUpdateType.MetadataEdit,
+                                            innerCt
+                                        )
+                                        .ConfigureAwait(false);
+                                }
+                                else
+                                {
+                                    EnterProbeCooldown(defOwnerId, manager, userId, item.Id);
+                                }
+                            }
+                        )
+                        .GetAwaiter()
+                        .GetResult();
+
+                    // Surface the freshly-probed tracks on the default source so the DTO
+                    // that is about to be built from this list carries them.
+                    def.MediaStreams = GetMediaStreamsWithExternalSubs(
+                        defOwner,
+                        defOwner.GelatoData<string>("filename")
+                    );
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Detail-view probe failed for {Id}", defOwnerId);
+                }
+            }
+        }
+
         // When streams are present, remove any remaining stub/placeholder sources
         // (e.g. those derived from the item's own virtual path via inner sources).
         if (gelatoSources.Count > 0)
