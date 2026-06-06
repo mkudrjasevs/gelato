@@ -704,6 +704,15 @@ public sealed class MediaSourceManagerDecorator(
             ? $"{streamName}\n{streamDesc}"
             : streamName;
 
+        // Resolve the source path from the immutable Gelato "path" field rather than the
+        // live item.Path: the playback probe transiently rewrites item.Path to a temporary
+        // /tmp/*.strm (then deletes it), and a concurrent transcode reading the shared item
+        // would otherwise capture that temp path and fail (FFmpeg exit 254). Fall back to
+        // item.Path only for items that predate this field (e.g. the placeholder source).
+        var streamPath = Get<string>(data, "path");
+        if (string.IsNullOrEmpty(streamPath))
+            streamPath = item.Path;
+
         var info = new MediaSourceInfo
         {
             Id = item.Id.ToString("N", CultureInfo.InvariantCulture),
@@ -715,7 +724,7 @@ public sealed class MediaSourceManagerDecorator(
             // array avoids a per-stream DB round-trip that always returns nothing.
             MediaAttachments = [],
             Name = richName,
-            Path = item.Path,
+            Path = streamPath,
             RunTimeTicks = item.RunTimeTicks,
             Container = item.Container,
             Size = item.Size,

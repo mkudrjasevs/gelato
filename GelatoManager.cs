@@ -567,6 +567,13 @@ public sealed class GelatoManager(
             }
             streamItem.SetGelatoData("index", index);
             streamItem.SetGelatoData("guid", streamGuid);
+            // Persist the canonical streamable URL separately from streamItem.Path. The
+            // playback probe temporarily overwrites streamItem.Path with a /tmp/*.strm file
+            // (and deletes it afterwards); if a transcode reads the shared item during that
+            // window it would capture the temp path and FFmpeg fails (exit 254). Resolving
+            // the source path from this immutable field instead makes playback immune to the
+            // probe's in-flight mutation.
+            streamItem.SetGelatoData("path", path);
             // Keep map current so stale detection below uses the final upserted set.
             existingByGuid[streamGuid] = streamItem;
 
