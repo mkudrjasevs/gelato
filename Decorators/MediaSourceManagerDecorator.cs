@@ -319,77 +319,6 @@ public sealed class MediaSourceManagerDecorator(
 
         sources.AddRange(gelatoSources);
 
-        // Detail-view audio/subtitle pickers are read by clients (e.g. Neptune) from the
-        // item DTO's MediaStreams, which only exist once the source has been probed. When
-        // serving an item-detail fetch, fully probe the default source BEFORE returning so
-        // the version, audio and subtitle choices are all present on first open. This blocks
-        // the detail request for the duration of the probe (a few seconds for a warm stream,
-        // longer for a cold one) — an accepted trade-off for having tracks available up
-        // front. Already-probed sources (those with a Video stream) are skipped, so the wait
-        // only happens the first time a given source is opened.
-        var isDetailFetch =
-            actionName is "GetItem" or "GetItemLegacy"
-            || (actionName == "GetItems" && ctx?.IsSingleItemList() == true);
-        if (isDetailFetch && gelatoSources.Count > 0)
-        {
-            var def = gelatoSources[0];
-            var defOwnerId = Guid.TryParse(def.ETag, out var dg) ? dg : Guid.Empty;
-            var needsProbe =
-                defOwnerId != Guid.Empty
-                && !string.IsNullOrEmpty(def.Path)
-                && (def.MediaStreams?.All(ms => ms.Type != MediaStreamType.Video) ?? true)
-                && !IsProbeOnCooldown(defOwnerId);
-
-            if (needsProbe && libraryManager.GetItemById(defOwnerId) is Video defOwner)
-            {
-                var defPath = def.Path!;
-                try
-                {
-                    _lock
-                        .RunSingleFlightAsync(
-                            defOwnerId,
-                            async innerCt =>
-                            {
-                                // Generous cap: allow a long wait for a cold stream but
-                                // never let a misbehaving server hang the request forever.
-                                using var probeCts =
-                                    CancellationTokenSource.CreateLinkedTokenSource(innerCt);
-                                probeCts.CancelAfter(TimeSpan.FromSeconds(60));
-                                if (
-                                    await ProbeStreamAsync(defOwner, defPath, probeCts.Token)
-                                        .ConfigureAwait(false)
-                                )
-                                {
-                                    await defOwner
-                                        .UpdateToRepositoryAsync(
-                                            ItemUpdateType.MetadataEdit,
-                                            innerCt
-                                        )
-                                        .ConfigureAwait(false);
-                                }
-                                else
-                                {
-                                    EnterProbeCooldown(defOwnerId, manager, userId, item.Id);
-                                }
-                            }
-                        )
-                        .GetAwaiter()
-                        .GetResult();
-
-                    // Surface the freshly-probed tracks on the default source so the DTO
-                    // that is about to be built from this list carries audio + subtitles.
-                    def.MediaStreams = GetMediaStreamsWithExternalSubs(
-                        defOwner,
-                        defOwner.GelatoData<string>("filename")
-                    );
-                }
-                catch (Exception ex)
-                {
-                    _log.LogWarning(ex, "Detail-view probe failed for {Id}", defOwnerId);
-                }
-            }
-        }
-
         // When streams are present, remove any remaining stub/placeholder sources
         // (e.g. those derived from the item's own virtual path via inner sources).
         if (gelatoSources.Count > 0)
@@ -492,13 +421,6 @@ public sealed class MediaSourceManagerDecorator(
         // Compute action name early — used to gate probing and source trimming below.
         var actionName = ctx?.GetActionName();
 
-        // Only probe on the initial playback setup request (GetPostedPlaybackInfo /
-        // GetPlaybackInfo). When seeking, the client calls GetHlsVideoSegment which
-        // also reaches GetPlaybackMediaSources. Re-probing there adds network latency
-        // before FFmpeg even starts, causing the client to time out. Exclude null so
-        // that calls from unknown/internal code paths don't accidentally probe.
-        var isSetupAction = actionName is "GetPostedPlaybackInfo" or "GetPlaybackInfo";
-
         // Identify the preferred source (explicit client choice, or first available).
         var selected = SelectByIdOrFirst(sources, mediaSourceId);
         if (selected is null)
@@ -513,36 +435,12 @@ public sealed class MediaSourceManagerDecorator(
                 return sources;
         }
 
-        // First-play ordering fix: on the very first playback of an item the stream rows
-        // often don't exist yet (no list prefetch ran, or the detail page never triggered
-        // a sync), so GetStaticMediaSources above returned only the null-path placeholder.
-        // NeedsProbe(placeholder) is false, so the probe below is skipped; the on-demand
-        // sync near the end of this method then creates the stream rows but returns them
-        // UNPROBED — leaving the client (e.g. Neptune) with no audio/subtitle tracks until
-        // the *next* play. Sync up-front here so the selected source is real and the probe
-        // below runs in THIS request.
-        if (isSetupAction && userId != Guid.Empty && string.IsNullOrEmpty(selected.Path))
-        {
-            try
-            {
-                var syncCount = await manager.SyncStreams(item, userId, ct).ConfigureAwait(false);
-                if (syncCount > 0)
-                {
-                    manager.SetStreamSync($"{userId}:{item.Id}");
-                    sources = GetStaticMediaSources(item, enablePathSubstitution, user);
-                    if (SelectByIdOrFirst(sources, mediaSourceId) is { } reselected)
-                    {
-                        selected = reselected;
-                        owner = ResolveOwnerFor(selected, item);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(ex, "Up-front stream sync failed for {Id}", item.Id);
-            }
-        }
-
+        // Only probe on the initial playback setup request (GetPostedPlaybackInfo /
+        // GetPlaybackInfo). When seeking, the client calls GetHlsVideoSegment which
+        // also reaches GetPlaybackMediaSources. Re-probing there adds network latency
+        // before FFmpeg even starts, causing the client to time out. Exclude null so
+        // that calls from unknown/internal code paths don't accidentally probe.
+        var isSetupAction = actionName is "GetPostedPlaybackInfo" or "GetPlaybackInfo";
         if (isSetupAction && NeedsProbe(selected) && !IsProbeOnCooldown(owner.Id))
         {
             // RunSingleFlightAsync deduplicates concurrent probes for the same source.
@@ -850,13 +748,7 @@ public sealed class MediaSourceManagerDecorator(
             info.Timestamp = video.Timestamp;
             info.IsRemote = true;
 
-            // Only adopt ShortcutPath when it is actually set. A probe in flight flips the
-            // shared item's IsShortcut flag on while leaving ShortcutPath null (it streams
-            // via a temporary .strm written to Path), so blindly copying ShortcutPath here
-            // would hand a concurrent reader an empty path — which on the transcode path
-            // becomes FFmpeg "-i \"\"" (exit 254). Keep the already-assigned item.Path
-            // (non-empty during the probe) when ShortcutPath is empty.
-            if (video.IsShortcut && !string.IsNullOrEmpty(video.ShortcutPath))
+            if (video.IsShortcut)
             {
                 info.IsRemote = true;
                 info.Path = video.ShortcutPath;
