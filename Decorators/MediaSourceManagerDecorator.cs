@@ -320,17 +320,13 @@ public sealed class MediaSourceManagerDecorator(
         sources.AddRange(gelatoSources);
 
         // Detail-view audio/subtitle pickers are read by clients (e.g. Neptune) from the
-        // item DTO's MediaStreams — which only exist once a source has been probed. Unlike
-        // the playback path, GetStaticMediaSources never probes, so on a fresh item the
-        // detail page shows only the version picker and NO track choices.
-        //
-        // Probe the default source when serving an item-detail fetch, but do this purely in
-        // the BACKGROUND and never block the response — an earlier synchronous version held
-        // up the whole detail DTO long enough that the client rendered an empty page (not
-        // even the version picker). The page therefore always renders immediately; the probe
-        // persists the tracks, and because stream-item identity is stable across re-syncs
-        // (see SyncStreams), that probe result survives URL rotation / restarts — so the
-        // title is probed at most once and tracks then appear on the next open and stay.
+        // item DTO's MediaStreams, which only exist once the source has been probed. When
+        // serving an item-detail fetch, fully probe the default source BEFORE returning so
+        // the version, audio and subtitle choices are all present on first open. This blocks
+        // the detail request for the duration of the probe (a few seconds for a warm stream,
+        // longer for a cold one) — an accepted trade-off for having tracks available up
+        // front. Already-probed sources (those with a Video stream) are skipped, so the wait
+        // only happens the first time a given source is opened.
         var isDetailFetch =
             actionName is "GetItem" or "GetItemLegacy"
             || (actionName == "GetItems" && ctx?.IsSingleItemList() == true);
@@ -347,41 +343,50 @@ public sealed class MediaSourceManagerDecorator(
             if (needsProbe && libraryManager.GetItemById(defOwnerId) is Video defOwner)
             {
                 var defPath = def.Path!;
-                // Fire-and-forget, untied to the request CancellationToken so it keeps
-                // running and persists even if the client gives up on this detail request.
-                _ = _lock.RunSingleFlightAsync(
-                    defOwnerId,
-                    async _ =>
-                    {
-                        try
-                        {
-                            using var probeCts = new CancellationTokenSource(
-                                TimeSpan.FromSeconds(20)
-                            );
-                            if (
-                                await ProbeStreamAsync(defOwner, defPath, probeCts.Token)
-                                    .ConfigureAwait(false)
-                            )
+                try
+                {
+                    _lock
+                        .RunSingleFlightAsync(
+                            defOwnerId,
+                            async innerCt =>
                             {
-                                await defOwner
-                                    .UpdateToRepositoryAsync(
-                                        ItemUpdateType.MetadataEdit,
-                                        CancellationToken.None
-                                    )
-                                    .ConfigureAwait(false);
+                                // Generous cap: allow a long wait for a cold stream but
+                                // never let a misbehaving server hang the request forever.
+                                using var probeCts =
+                                    CancellationTokenSource.CreateLinkedTokenSource(innerCt);
+                                probeCts.CancelAfter(TimeSpan.FromSeconds(60));
+                                if (
+                                    await ProbeStreamAsync(defOwner, defPath, probeCts.Token)
+                                        .ConfigureAwait(false)
+                                )
+                                {
+                                    await defOwner
+                                        .UpdateToRepositoryAsync(
+                                            ItemUpdateType.MetadataEdit,
+                                            innerCt
+                                        )
+                                        .ConfigureAwait(false);
+                                }
+                                else
+                                {
+                                    EnterProbeCooldown(defOwnerId, manager, userId, item.Id);
+                                }
                             }
-                            else
-                            {
-                                EnterProbeCooldown(defOwnerId, manager, userId, item.Id);
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _log.LogWarning(ex, "Detail-view probe failed for {Id}", defOwnerId);
-                        }
-                    },
-                    CancellationToken.None
-                );
+                        )
+                        .GetAwaiter()
+                        .GetResult();
+
+                    // Surface the freshly-probed tracks on the default source so the DTO
+                    // that is about to be built from this list carries audio + subtitles.
+                    def.MediaStreams = GetMediaStreamsWithExternalSubs(
+                        defOwner,
+                        defOwner.GelatoData<string>("filename")
+                    );
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Detail-view probe failed for {Id}", defOwnerId);
+                }
             }
         }
 
@@ -845,7 +850,13 @@ public sealed class MediaSourceManagerDecorator(
             info.Timestamp = video.Timestamp;
             info.IsRemote = true;
 
-            if (video.IsShortcut)
+            // Only adopt ShortcutPath when it is actually set. A probe in flight flips the
+            // shared item's IsShortcut flag on while leaving ShortcutPath null (it streams
+            // via a temporary .strm written to Path), so blindly copying ShortcutPath here
+            // would hand a concurrent reader an empty path — which on the transcode path
+            // becomes FFmpeg "-i \"\"" (exit 254). Keep the already-assigned item.Path
+            // (non-empty during the probe) when ShortcutPath is empty.
+            if (video.IsShortcut && !string.IsNullOrEmpty(video.ShortcutPath))
             {
                 info.IsRemote = true;
                 info.Path = video.ShortcutPath;
