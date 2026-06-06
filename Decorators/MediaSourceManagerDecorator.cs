@@ -421,6 +421,13 @@ public sealed class MediaSourceManagerDecorator(
         // Compute action name early — used to gate probing and source trimming below.
         var actionName = ctx?.GetActionName();
 
+        // Only probe on the initial playback setup request (GetPostedPlaybackInfo /
+        // GetPlaybackInfo). When seeking, the client calls GetHlsVideoSegment which
+        // also reaches GetPlaybackMediaSources. Re-probing there adds network latency
+        // before FFmpeg even starts, causing the client to time out. Exclude null so
+        // that calls from unknown/internal code paths don't accidentally probe.
+        var isSetupAction = actionName is "GetPostedPlaybackInfo" or "GetPlaybackInfo";
+
         // Identify the preferred source (explicit client choice, or first available).
         var selected = SelectByIdOrFirst(sources, mediaSourceId);
         if (selected is null)
@@ -435,12 +442,36 @@ public sealed class MediaSourceManagerDecorator(
                 return sources;
         }
 
-        // Only probe on the initial playback setup request (GetPostedPlaybackInfo /
-        // GetPlaybackInfo). When seeking, the client calls GetHlsVideoSegment which
-        // also reaches GetPlaybackMediaSources. Re-probing there adds network latency
-        // before FFmpeg even starts, causing the client to time out. Exclude null so
-        // that calls from unknown/internal code paths don't accidentally probe.
-        var isSetupAction = actionName is "GetPostedPlaybackInfo" or "GetPlaybackInfo";
+        // First-play ordering fix: on the very first playback of an item the stream rows
+        // often don't exist yet (no list prefetch ran, or the detail page never triggered
+        // a sync), so GetStaticMediaSources above returned only the null-path placeholder.
+        // NeedsProbe(placeholder) is false, so the probe below is skipped; the on-demand
+        // sync near the end of this method then creates the stream rows but returns them
+        // UNPROBED — leaving the client (e.g. Neptune) with no audio/subtitle tracks until
+        // the *next* play. Sync up-front here so the selected source is real and the probe
+        // below runs in THIS request.
+        if (isSetupAction && userId != Guid.Empty && string.IsNullOrEmpty(selected.Path))
+        {
+            try
+            {
+                var syncCount = await manager.SyncStreams(item, userId, ct).ConfigureAwait(false);
+                if (syncCount > 0)
+                {
+                    manager.SetStreamSync($"{userId}:{item.Id}");
+                    sources = GetStaticMediaSources(item, enablePathSubstitution, user);
+                    if (SelectByIdOrFirst(sources, mediaSourceId) is { } reselected)
+                    {
+                        selected = reselected;
+                        owner = ResolveOwnerFor(selected, item);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Up-front stream sync failed for {Id}", item.Id);
+            }
+        }
+
         if (isSetupAction && NeedsProbe(selected) && !IsProbeOnCooldown(owner.Id))
         {
             // RunSingleFlightAsync deduplicates concurrent probes for the same source.
