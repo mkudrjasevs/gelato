@@ -107,6 +107,14 @@
               </label>
             </div>
 
+            <div class="checkboxContainer checkboxContainer-withDescription">
+              <label>
+                <input is="emby-checkbox" type="checkbox" id="chkLimitEmbeddedSubtitles" />
+                <span>Limit embedded subtitles to library languages</span>
+              </label>
+              <div class="fieldDescription">Only expose embedded subtitle tracks whose language is in the library's subtitle languages (forced tracks always kept). Prevents Jellyfin from demuxing the whole remote file to extract dozens of subtitle tracks on first play. Recommended.</div>
+            </div>
+
             <div class="checkboxContainer checkboxContainer-withDescription" style="margin-bottom: 0.5em;">
               <label>
                 <input is="emby-checkbox" type="checkbox" id="chkFilterUnreleased" />
@@ -294,6 +302,7 @@
         const chkEnableMixed = page.querySelector('#chkEnableMixed');
         const chkExtendLocalSeriesTrees = page.querySelector('#chkExtendLocalSeriesTrees');
         const chkDisableSearch = page.querySelector('#chkDisableSearch');
+        const chkLimitEmbeddedSubtitles = page.querySelector('#chkLimitEmbeddedSubtitles');
         const chkFilterUnreleased = page.querySelector('#chkFilterUnreleased');
         const txtBufferDays = page.querySelector('#txtBufferDays');
         const txtFFmpegAnalyzeDuration = page.querySelector('#txtFFmpegAnalyzeDuration');
@@ -588,6 +597,7 @@
             if (chkEnableMixed) chkEnableMixed.checked = cfg.EnableMixed ?? true;
             if (chkExtendLocalSeriesTrees) chkExtendLocalSeriesTrees.checked = cfg.ExtendLocalSeriesTrees ?? false;
             if (chkDisableSearch) chkDisableSearch.checked = cfg.DisableSearch || false;
+            if (chkLimitEmbeddedSubtitles) chkLimitEmbeddedSubtitles.checked = cfg.LimitEmbeddedSubtitles !== false;
             if (chkFilterUnreleased) chkFilterUnreleased.checked = cfg.FilterUnreleased || false;
             if (txtBufferDays) txtBufferDays.value = cfg.FilterUnreleasedBufferDays ?? 0;
             if (txtFFmpegAnalyzeDuration) txtFFmpegAnalyzeDuration.value = cfg.FFmpegAnalyzeDuration || "5M";
@@ -622,6 +632,7 @@
             cfg.ExtendLocalSeriesTrees = chkExtendLocalSeriesTrees.checked;
 
             cfg.DisableSearch = chkDisableSearch.checked;
+            cfg.LimitEmbeddedSubtitles = chkLimitEmbeddedSubtitles.checked;
             cfg.FilterUnreleased = chkFilterUnreleased.checked;
             cfg.FilterUnreleasedBufferDays = txtBufferDays.value !== '' ? parseInt(txtBufferDays.value) : 0;
 

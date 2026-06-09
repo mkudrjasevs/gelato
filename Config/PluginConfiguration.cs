@@ -26,6 +26,14 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool CreateCollections { get; set; } = false;
     public int MaxCollectionItems { get; set; } = 100;
     public bool DisableSearch { get; set; } = false;
+
+    /// <summary>
+    /// Only expose embedded subtitle tracks whose language is in the library's configured
+    /// subtitle languages (forced tracks are always kept). Jellyfin pre-extracts every
+    /// embedded text subtitle to a sidecar on first play; for a remote MKV with many sub
+    /// tracks that means demuxing the whole file. Capping keeps that to a handful.
+    /// </summary>
+    public bool LimitEmbeddedSubtitles { get; set; } = true;
     public bool EnableJavaScriptInjection { get; set; } = false;
     public bool LazyImages { get; set; } = false;
     public List<CatalogConfig> Catalogs { get; set; } = [];
@@ -97,6 +105,7 @@ public class UserConfig
             P2PULSpeed = baseConfig.P2PULSpeed,
             FFmpegAnalyzeDuration = baseConfig.FFmpegAnalyzeDuration,
             FFmpegProbeSize = baseConfig.FFmpegProbeSize,
+            LimitEmbeddedSubtitles = baseConfig.LimitEmbeddedSubtitles,
             CreateCollections = baseConfig.CreateCollections,
             MaxCollectionItems = baseConfig.MaxCollectionItems,
             EnableJavaScriptInjection = baseConfig.EnableJavaScriptInjection,
