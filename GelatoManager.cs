@@ -484,6 +484,30 @@ public sealed class GelatoManager(
             }
         }
 
+        // Addons/debrid services rotate the playback URL on every fetch (signed, expiring
+        // links). Both GetGuid() and the stream item's Id are derived from that URL, so a
+        // rotated URL would otherwise mint a brand-new item and orphan the MediaStreams a
+        // probe saved against the OLD item Id — forcing a slow re-probe on the next play.
+        // Index existing rows by a URL-independent signature (release filename + binge group)
+        // so a rotated URL rebinds to the SAME item, keeping its Id and its probed tracks.
+        static string? StreamSignature(string? filename, string? bingeGroup) =>
+            string.IsNullOrEmpty(filename) ? null : $"{bingeGroup}|{filename}";
+
+        var existingBySignature = new Dictionary<string, Video>(StringComparer.Ordinal);
+        foreach (var existingItem in existingStreamItems)
+        {
+            var sig = StreamSignature(
+                existingItem.GelatoData<string>("filename"),
+                existingItem.GelatoData<string>("bingeGroup")
+            );
+            if (sig is not null)
+                existingBySignature.TryAdd(sig, existingItem);
+        }
+
+        // Item Ids already bound to an incoming stream this sync, so one row is never reused
+        // for two different streams.
+        var consumedItemIds = new HashSet<Guid>();
+
         var upsertedStreams = new List<Video>();
 
         for (var i = 0; i < acceptable.Count; i++)
@@ -502,6 +526,23 @@ public sealed class GelatoManager(
 
             var streamGuid = s.GetGuid();
             var isNewStreamItem = !existingByGuid.TryGetValue(streamGuid, out var streamItem);
+
+            // URL (and thus guid) rotated but the underlying release is unchanged: rebind to
+            // the existing item by signature so its probed MediaStreams survive. Only the
+            // Path/guid are refreshed below; the Id, which keys the saved tracks, stays.
+            if (isNewStreamItem)
+            {
+                var sig = StreamSignature(s.BehaviorHints?.Filename, s.BehaviorHints?.BingeGroup);
+                if (
+                    sig is not null
+                    && existingBySignature.TryGetValue(sig, out var bySig)
+                    && !consumedItemIds.Contains(bySig.Id)
+                )
+                {
+                    streamItem = bySig;
+                    isNewStreamItem = false;
+                }
+            }
 
             if (isNewStreamItem)
             {
@@ -525,6 +566,9 @@ public sealed class GelatoManager(
                 streamItem.Path = path;
                 streamItem.Id = libraryManager.GetNewItemId(streamItem.Path, streamItem.GetType());
             }
+
+            // Claim this row so a later stream in the same response can't rebind to it.
+            consumedItemIds.Add(streamItem.Id);
 
             streamItem.Name = video.Name;
             streamItem.Tags = [StreamTag];
