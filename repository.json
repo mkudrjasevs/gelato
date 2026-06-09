@@ -9,6 +9,14 @@
     "versions": [
       {
         "changelog": "",
+        "checksum": "dd1f8d935701d52ce99b62cb684ce533",
+        "sourceUrl": "https://github.com/mkudrjasevs/gelato/releases/download/v0.27.2.15/gelato_0.27.2.15.zip",
+        "targetAbi": "10.11.6.0",
+        "timestamp": "2026-06-09T14:07:25Z",
+        "version": "0.27.2.15"
+      },
+      {
+        "changelog": "",
         "checksum": "8f514ba57768b61d5b57d4c410e2c535",
         "sourceUrl": "https://github.com/mkudrjasevs/gelato/releases/download/0.27.2.14/gelato_0.27.2.14.zip",
         "targetAbi": "10.11.6.0",
@@ -238,14 +246,6 @@
         "targetAbi": "10.11.6.0",
         "timestamp": "2026-06-02T08:07:54Z",
         "version": "0.27.0.0"
-      },
-      {
-        "changelog": "",
-        "checksum": "c62745cfb240bdcf4a98e61de75388f4",
-        "sourceUrl": "https://github.com/mkudrjasevs/gelato/releases/download/v0.26.0.0/gelato_0.26.15.1.zip",
-        "targetAbi": "10.11.6.0",
-        "timestamp": "2026-06-02T07:20:56Z",
-        "version": "0.26.15.1"
       }
     ]
   }
