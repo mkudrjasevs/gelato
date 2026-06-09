@@ -799,29 +799,6 @@ public sealed class MediaSourceManagerDecorator(
     {
         var streams = _inner.GetMediaStreams(item.Id).ToList();
 
-        // Cap embedded text-subtitle tracks to the library's configured subtitle languages
-        // (forced tracks always kept). Jellyfin pre-extracts EVERY embedded text sub to a
-        // sidecar on first play; for a remote MKV that demuxes the entire multi-GB file, so a
-        // release with 20-30 sub tracks is pathological on CPU/network. Original indices are
-        // preserved so the kept tracks still map/extract correctly; external (Stremio /
-        // metadata-folder) subs are never touched.
-        if (GelatoPlugin.Instance!.Configuration.LimitEmbeddedSubtitles)
-        {
-            var langs = _libraryManager.GetLibraryOptions(item).SubtitleDownloadLanguages;
-            if (langs is { Length: > 0 })
-            {
-                var wanted = new HashSet<string>(langs, StringComparer.OrdinalIgnoreCase);
-                streams = streams
-                    .Where(s =>
-                        s.Type != MediaStreamType.Subtitle
-                        || s.IsExternal
-                        || s.IsForced
-                        || (!string.IsNullOrEmpty(s.Language) && wanted.Contains(s.Language))
-                    )
-                    .ToList();
-            }
-        }
-
         if (string.IsNullOrEmpty(gelatoFilename))
             return streams;
 
