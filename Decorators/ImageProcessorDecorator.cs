@@ -62,7 +62,12 @@ public sealed class ImageProcessorDecorator(
                 var urlFile = ResolveUrlFile(imagePath, options);
                 if (urlFile is not null)
                 {
-                    var url = (await File.ReadAllTextAsync(urlFile).ConfigureAwait(false)).Trim();
+                    // ProcessImage has no CancellationToken parameter (interface), so cap
+                    // the download ourselves instead of letting it run unbounded.
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                    var url = (
+                        await File.ReadAllTextAsync(urlFile, cts.Token).ConfigureAwait(false)
+                    ).Trim();
                     try
                     {
                         await providerManager.Value
@@ -71,7 +76,7 @@ public sealed class ImageProcessorDecorator(
                                 url,
                                 options.Image!.Type,
                                 options.ImageIndex,
-                                CancellationToken.None
+                                cts.Token
                             )
                             .ConfigureAwait(false);
                         // Re-read the image info — Jellyfin may have saved to a different path.

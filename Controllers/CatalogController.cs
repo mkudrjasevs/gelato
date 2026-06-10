@@ -1,7 +1,6 @@
 using Gelato.Config;
 using Gelato.ScheduledTasks;
 using Gelato.Services;
-using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -16,8 +15,7 @@ public class CatalogController(
     ILogger<CatalogController> logger,
     CatalogService catalogService,
     CatalogImportService importService,
-    ITaskManager taskManager,
-    ILibraryManager libraryManager
+    ITaskManager taskManager
 ) : ControllerBase
 {
     [HttpGet]
@@ -50,23 +48,13 @@ public class CatalogController(
     {
         logger.LogInformation("Manual import triggered for {Id} {Type}", id, type);
 
-        // Run in background? Or await?
-        // User probably wants to know it started.
-        // Awaiting might timeout if it takes long.
-        // But existing implementations awaited.
-        // Let's fire and forget but log, or return accepted.
-        // "Straight approach" -> maybe just await it so user sees errors?
-        // But browser timeout is 2 mins usually. Import can take longer.
-        // Better to run in background.
-
+        // Imports can outlive any client/browser timeout, so run in the background
+        // and return 202 immediately.
         _ = Task.Run(async () =>
         {
             try
             {
                 await importService.ImportCatalogAsync(id, type, CancellationToken.None);
-                //await libraryManager
-                //    .ValidateMediaLibrary(new Progress<double>(), CancellationToken.None)
-                //    .ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -82,19 +70,15 @@ public class CatalogController(
     {
         logger.LogInformation("Manual import triggered for all enabled catalogs");
 
-        _ = Task.Run(() =>
+        // Queuing is a fast synchronous call; the task manager runs the import itself.
+        try
         {
-            try
-            {
-                taskManager.CancelIfRunningAndQueue<GelatoCatalogItemsSyncTask>();
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Error in manual import for all enabled catalogs");
-            }
-
-            return Task.CompletedTask;
-        });
+            taskManager.CancelIfRunningAndQueue<GelatoCatalogItemsSyncTask>();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error in manual import for all enabled catalogs");
+        }
 
         return Accepted();
     }

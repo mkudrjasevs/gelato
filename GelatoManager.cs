@@ -417,8 +417,12 @@ public sealed class GelatoManager(
             return 0;
         }
 
-        var providerIds = video.ProviderIds;
-        providerIds.TryAdd("Stremio", uri.ExternalId);
+        // Ensure the live item carries its Stremio id (in-memory only): downstream
+        // lookups (MediaSourceManagerDecorator stream query, IsGelato checks) read it
+        // off this same cached instance within the request.
+        video.ProviderIds.TryAdd("Stremio", uri.ExternalId);
+        // Stream items get copies below so they never alias the live item's dictionary.
+        var providerIds = new Dictionary<string, string>(video.ProviderIds);
 
         var cfg = GelatoPlugin.Instance!.GetConfig(userId);
         var stremio = cfg.Stremio;
@@ -578,8 +582,8 @@ public sealed class GelatoManager(
                 locked.Add(MetadataField.Tags);
             streamItem.LockedFields = locked.ToArray();
 
-            streamItem.ProviderIds = providerIds;
-            streamItem.RunTimeTicks = video.RunTimeTicks ?? video.RunTimeTicks;
+            streamItem.ProviderIds = new Dictionary<string, string>(providerIds);
+            streamItem.RunTimeTicks = video.RunTimeTicks;
             streamItem.LinkedAlternateVersions = [];
             streamItem.SetPrimaryVersionId(null);
             streamItem.PremiereDate = video.PremiereDate;
@@ -594,30 +598,31 @@ public sealed class GelatoManager(
 
             var users = streamItem.GelatoData<List<Guid>>("userIds") ?? [];
             if (!users.Contains(userId))
-            {
                 users.Add(userId);
-                streamItem.SetGelatoData("userIds", users);
-            }
 
-            streamItem.SetGelatoData("name", s.Name);
-            streamItem.SetGelatoData("description", s.Description);
+            // Single JSON round-trip for all keys; the per-key SetGelatoData overload
+            // re-parses the whole ExternalId blob on every call.
+            //
+            // "path" persists the canonical streamable URL separately from streamItem.Path.
+            // The playback probe temporarily overwrites streamItem.Path with a /tmp/*.strm
+            // file (and deletes it afterwards); if a transcode reads the shared item during
+            // that window it would capture the temp path and FFmpeg fails (exit 254).
+            // Resolving the source path from this immutable field instead makes playback
+            // immune to the probe's in-flight mutation.
+            var gelatoData = new List<KeyValuePair<string, object?>>
+            {
+                new("userIds", users),
+                new("name", s.Name),
+                new("description", s.Description),
+                new("index", index),
+                new("guid", streamGuid),
+                new("path", path),
+            };
             if (!string.IsNullOrEmpty(s.BehaviorHints?.BingeGroup))
-            {
-                streamItem.SetGelatoData("bingeGroup", s.BehaviorHints.BingeGroup);
-            }
+                gelatoData.Add(new("bingeGroup", s.BehaviorHints.BingeGroup));
             if (!string.IsNullOrEmpty(s.BehaviorHints?.Filename))
-            {
-                streamItem.SetGelatoData("filename", s.BehaviorHints.Filename);
-            }
-            streamItem.SetGelatoData("index", index);
-            streamItem.SetGelatoData("guid", streamGuid);
-            // Persist the canonical streamable URL separately from streamItem.Path. The
-            // playback probe temporarily overwrites streamItem.Path with a /tmp/*.strm file
-            // (and deletes it afterwards); if a transcode reads the shared item during that
-            // window it would capture the temp path and FFmpeg fails (exit 254). Resolving
-            // the source path from this immutable field instead makes playback immune to the
-            // probe's in-flight mutation.
-            streamItem.SetGelatoData("path", path);
+                gelatoData.Add(new("filename", s.BehaviorHints.Filename));
+            streamItem.SetGelatoData(gelatoData);
             // Keep map current so stale detection below uses the final upserted set.
             existingByGuid[streamGuid] = streamItem;
 
@@ -647,18 +652,23 @@ public sealed class GelatoManager(
             .ToList();
         var toSave = stale.Except(toDelete).ToList();
 
-        try
+        foreach (var staleItem in toDelete)
         {
-            //repo.DeleteItem([.. toDelete.Select(f => f.Id)]);
-        }
-        catch
-        {
-            foreach (var staleItem in toDelete)
+            try
             {
                 libraryManager.DeleteItem(
                     staleItem,
                     new DeleteOptions { DeleteFileLocation = true },
                     true
+                );
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Failed to delete stale stream {Name} ({Id})",
+                    staleItem.Name,
+                    staleItem.Id
                 );
             }
         }

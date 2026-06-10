@@ -219,7 +219,7 @@ public sealed class MediaSourceManagerDecorator(
 
         // we dont use jellyfins alternate versions crap. So we have to load it ourselves
 
-        InternalItemsQuery query;
+        InternalItemsQuery? query;
 
         if (item.GetBaseItemKind() == BaseItemKind.Episode)
         {
@@ -237,14 +237,14 @@ public sealed class MediaSourceManagerDecorator(
                 IndexNumber = episode.IndexNumber,
             };
         }
-        else
+        else if ((uri?.ExternalId ?? item.GetProviderId("Stremio")) is { Length: > 0 } stremioId)
         {
             query = new InternalItemsQuery
             {
                 IncludeItemTypes = [item.GetBaseItemKind()],
                 HasAnyProviderId = new Dictionary<string, string>
                 {
-                    { "Stremio", item.GetProviderId("Stremio") },
+                    { "Stremio", stremioId },
                 },
                 Recursive = false,
                 GroupByPresentationUniqueKey = false,
@@ -253,6 +253,13 @@ public sealed class MediaSourceManagerDecorator(
                 IsDeadPerson = true,
                 Tags = [GelatoManager.StreamTag],
             };
+        }
+        else
+        {
+            // Mixed-content (EnableMixed) lets non-Gelato movies through; without a
+            // Stremio id there are no Gelato stream rows to load, and a null value
+            // in HasAnyProviderId would poison the query.
+            query = null;
         }
 
         // Parse each stream item's ExternalId JSON once and thread it through the
@@ -263,7 +270,8 @@ public sealed class MediaSourceManagerDecorator(
         //
         // Sort key is extracted into a named tuple field BEFORE OrderBy so the
         // comparison-based sort doesn't re-invoke GetAllGelatoData O(N log N) times.
-        var gelatoSources = repo.GetItemList(query)
+        IReadOnlyList<BaseItem> gelatoItems = query is null ? [] : repo.GetItemList(query);
+        var gelatoSources = gelatoItems
             .OfType<Video>()
             .Where(x => x.IsGelato())
             .Select(x => (Item: x, Data: x.GetAllGelatoData()))
@@ -342,9 +350,8 @@ public sealed class MediaSourceManagerDecorator(
             sources.Add(placeholder);
         }
 
-        if (sources.Count > 0)
-            sources[0].Type = MediaSourceType.Default;
-
+        // The failsafe above guarantees at least one source.
+        sources[0].Type = MediaSourceType.Default;
         sources[0].Id = item.Id.ToString("N");
 
         return sources;

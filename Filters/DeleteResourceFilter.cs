@@ -1,5 +1,6 @@
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Model.Entities;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Filters;
 using Microsoft.Extensions.Logging;
@@ -59,12 +60,21 @@ public sealed class DeleteResourceFilter(
 
     private void DeleteStreams(BaseItem item)
     {
+        // An empty value in HasAnyProviderId matches ANY Stremio id (see PurgeStreams),
+        // which would delete unrelated items — bail out if the id is missing.
+        var stremioId = item.GetProviderId("Stremio");
+        if (string.IsNullOrEmpty(stremioId))
+        {
+            log.LogWarning("Cannot delete streams for {Name}: no Stremio id", item.Name);
+            return;
+        }
+
         var query = new InternalItemsQuery
         {
             IncludeItemTypes = [item.GetBaseItemKind()],
             HasAnyProviderId = new Dictionary<string, string>
             {
-                { "Stremio", item.ProviderIds["Stremio"] },
+                { "Stremio", stremioId },
             },
             Recursive = false,
             GroupByPresentationUniqueKey = false,

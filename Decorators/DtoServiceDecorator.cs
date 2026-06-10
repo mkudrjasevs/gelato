@@ -1,5 +1,4 @@
 using Jellyfin.Data.Enums;
-using MediaBrowser.Model.MediaInfo;
 using Jellyfin.Database.Implementations.Entities; // User
 using MediaBrowser.Controller.Dto;
 using MediaBrowser.Controller.Entities;
@@ -51,9 +50,9 @@ public sealed class DtoServiceDecorator(IDtoService inner, Lazy<GelatoManager> m
     )
     {
         // im going to hell for this
-        var item = items.FirstOrDefault();
+        var first = items.FirstOrDefault();
 
-        if (item != null && item.GetBaseItemKind() == BaseItemKind.BoxSet)
+        if (first != null && first.GetBaseItemKind() == BaseItemKind.BoxSet)
         {
             options.EnableUserData = false;
         }
@@ -65,9 +64,11 @@ public sealed class DtoServiceDecorator(IDtoService inner, Lazy<GelatoManager> m
         // MediaSourceManagerDecorator). Browsing a library, home screen, show or season
         // just returns the already-stored item metadata.
 
-        foreach (var itemDto in list)
+        // Inner returns one DTO per input item in order; pair them up so per-item
+        // checks (CanDelete) run against the right item, not items[0].
+        for (var i = 0; i < list.Count; i++)
         {
-            Patch(itemDto, item, true, user);
+            Patch(list[i], i < items.Count ? items[i] : null, true, user);
         }
         return list;
     }
@@ -105,13 +106,6 @@ public sealed class DtoServiceDecorator(IDtoService inner, Lazy<GelatoManager> m
 
         if (IsGelato(dto))
         {
-            if (dto.Path is not null && dto.Path.IsUrl())
-            {
-                // dto.Path = "/stub";
-
-
-            }
-
             dto.CanDownload = true;
             // mark if placeholder
             if (
@@ -126,15 +120,6 @@ public sealed class DtoServiceDecorator(IDtoService inner, Lazy<GelatoManager> m
                 )
             )
             {
-                if (dto.MediaSources != null)
-                {
-                    foreach (var source in dto.MediaSources)
-                    {
-                        //source.Path = "/stub";
-                        //source.IsRemote = false;
-                        // source.Protocol = MediaProtocol.File;
-                    }
-                }
                 return;
             }
 

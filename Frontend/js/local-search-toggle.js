@@ -81,20 +81,20 @@
     function refreshSearchResults(query) {
         if (!query) return;
 
-        console.log('[Cavea] Refreshing search results for:', query);
+        console.log('[Gelato] Refreshing search results for:', query);
 
         try {
             // Clear the search input
             const searchInput = document.querySelector('#searchTextInput, .emby-input.searchfields-txtSearch, input[type="text"][placeholder*="Search"]');
             if (searchInput) {
                 searchInput.value = '';
-                console.log('[Cavea] Cleared search input');
+                console.log('[Gelato] Cleared search input');
             }
 
             // Find the search results container
             const searchPage = document.querySelector('.itemsContainer, .searchResults, [data-role="page"]');
             if (!searchPage) {
-                console.warn('[Cavea] Could not find search results container');
+                console.warn('[Gelato] Could not find search results container');
                 return;
             }
 
@@ -117,7 +117,7 @@
             window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
 
         } catch (error) {
-            console.error('[Cavea] Error refreshing search:', error);
+            console.error('[Gelato] Error refreshing search:', error);
         }
     }
 
@@ -230,7 +230,7 @@
             });
             obs.observe(document.documentElement, { childList: true, subtree: true });
         } catch (error) {
-            console.error('[Cavea] ERROR in init():', error);
+            console.error('[Gelato] ERROR in init():', error);
         }
     }
 

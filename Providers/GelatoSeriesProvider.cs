@@ -46,6 +46,24 @@ public sealed class GelatoSeriesProvider : IRemoteMetadataProvider<Series, Serie
         GenericEventArgs<BaseItem> genericEventArgs
     )
     {
+        // async void: any exception escaping this handler crashes the process,
+        // so the entire body must stay inside the try.
+        try
+        {
+            await OnRefreshStartedAsync(genericEventArgs).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(
+                ex,
+                "Refresh-started handler failed for {Name}",
+                genericEventArgs.Argument?.Name
+            );
+        }
+    }
+
+    private async Task OnRefreshStartedAsync(GenericEventArgs<BaseItem> genericEventArgs)
+    {
         var cfg = GelatoPlugin.Instance!.GetConfig(Guid.Empty);
         var stremio = cfg.Stremio;
         if (stremio == null)
@@ -93,7 +111,17 @@ public sealed class GelatoSeriesProvider : IRemoteMetadataProvider<Series, Serie
             return;
         }
 
-        // Update cache before syncing
+        // Update cache before syncing. Opportunistic sweep: entries are never read
+        // again after expiry, so without this the dictionary grows with library size.
+        if (_syncCache.Count >= 256)
+        {
+            foreach (var kv in _syncCache)
+            {
+                if (now - kv.Value >= CacheExpiry)
+                    _syncCache.TryRemove(kv.Key, out _);
+            }
+        }
+
         _syncCache[series.Id] = now;
 
         var isLocal = !series.IsGelato();

@@ -46,9 +46,6 @@ public sealed class IntroDbClient
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
-        _httpClient = httpClient;
-        _logger = logger;
-
         if (_httpClient.BaseAddress is null)
         {
             _httpClient.BaseAddress = new Uri(BaseUrl, UriKind.Absolute);

@@ -28,12 +28,31 @@ public class GelatoStremioProvider(
         (StremioMeta Meta, DateTime Expiry)
     > _metaCache = new(StringComparer.OrdinalIgnoreCase);
 
+    private const int MetaCacheSweepThreshold = 1024;
+
     private StremioMeta? GetCachedMeta(string id)
     {
         if (_metaCache.TryGetValue(id, out var entry) && entry.Expiry > DateTime.UtcNow)
             return entry.Meta;
         _metaCache.TryRemove(id, out _);
         return null;
+    }
+
+    private void CacheMeta(string id, StremioMeta meta, TimeSpan ttl)
+    {
+        // Opportunistic sweep: expired entries are otherwise only evicted when their
+        // own key is re-read, so the cache would grow monotonically while browsing.
+        if (_metaCache.Count >= MetaCacheSweepThreshold)
+        {
+            var now = DateTime.UtcNow;
+            foreach (var kv in _metaCache)
+            {
+                if (kv.Value.Expiry <= now)
+                    _metaCache.TryRemove(kv.Key, out _);
+            }
+        }
+
+        _metaCache[id] = (meta, DateTime.UtcNow.Add(ttl));
     }
 
     private HttpClient NewClient()
@@ -249,7 +268,7 @@ public class GelatoStremioProvider(
         var url = BuildUrl(["meta", mediaType.ToString().ToLower(), id]);
         var r = await GetJsonAsync<StremioMetaResponse>(url);
         if (r?.Meta is { } meta)
-            _metaCache[id] = (meta, DateTime.UtcNow.Add(ttl ?? MetaCacheTtl));
+            CacheMeta(id, meta, ttl ?? MetaCacheTtl);
         return r?.Meta;
     }
 
@@ -358,7 +377,7 @@ public class GelatoStremioProvider(
     {
         var url = BuildUrl(["subtitles", mediaType.ToString().ToLower(), id]);
         var r = await GetJsonAsync<StremioSubtitleResponse>(url);
-        return r.Subtitles;
+        return r.Subtitles ?? [];
     }
 
     public async Task<IReadOnlyList<StremioMeta>> GetCatalogMetasAsync(

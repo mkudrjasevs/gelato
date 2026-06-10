@@ -52,6 +52,7 @@ public sealed class GelatoApiController : ControllerBase
     // Moved to CatalogController
 
     [HttpGet("subtitles/{itemId:guid}")]
+    [Authorize]
     public ActionResult<IEnumerable<StremioSubtitle>> GetSubtitles(
         [FromRoute, Required] Guid itemId
     )
@@ -83,6 +84,12 @@ public sealed class GelatoApiController : ControllerBase
 
         var ct = HttpContext.RequestAborted;
 
+        var infoHashes =
+            TryParseInfoHashes(ih)
+            ?? throw new ArgumentException("Invalid infohash or magnet.", nameof(ih));
+        var announce = ParseTrackers(trackers) ?? DefaultTrackers();
+        var magnet = new MagnetLink(infoHashes, name: null, announceUrls: announce);
+
         var settings = new EngineSettingsBuilder
         {
             MaximumConnections = 40,
@@ -91,121 +98,102 @@ public sealed class GelatoApiController : ControllerBase
         }.ToSettings();
 
         var engine = new ClientEngine(settings);
+        TorrentManager? manager = null;
+        CancellationTokenSource? timerCts = null;
+        Timer? timer = null;
 
-        var infoHashes =
-            TryParseInfoHashes(ih)
-            ?? throw new ArgumentException("Invalid infohash or magnet.", nameof(ih));
-        var announce = ParseTrackers(trackers) ?? DefaultTrackers();
-        var magnet = new MagnetLink(infoHashes, name: null, announceUrls: announce);
-
-        var manager = await engine.AddStreamingAsync(magnet, _downloadPath);
-        await manager.StartAsync();
-
-        if (!manager.HasMetadata)
+        // Tear everything down on any path that doesn't hand a stream to the client;
+        // the ct.Register below only covers disconnects after streaming has started.
+        async Task CleanupAsync()
         {
-            while (!manager.HasMetadata && !ct.IsCancellationRequested)
-                await Task.Delay(100, ct);
-
-            if (!manager.HasMetadata)
-                return StatusCode(503, "Metadata not yet available.");
+            try { timerCts?.Cancel(); } catch { /* ignored */ }
+            try { timer?.Dispose(); } catch { /* ignored */ }
+            try
+            {
+                if (manager is not null)
+                    await manager.StopAsync();
+            }
+            catch { /* ignored */ }
+            try { engine.Dispose(); } catch { /* ignored */ }
         }
 
-        var selected =
-            idx is { } i and >= 0 && i < manager.Files.Count
-                ? manager.Files[i]
-                : (
-                    !string.IsNullOrWhiteSpace(filename)
-                        ? manager.Files.FirstOrDefault(x =>
-                            x.Path.EndsWith(filename, StringComparison.OrdinalIgnoreCase)
-                            || string.Equals(
-                                Path.GetFileName(x.Path),
-                                filename,
-                                StringComparison.OrdinalIgnoreCase
-                            )
-                        ) ?? PickHeuristic(manager)
-                        : PickHeuristic(manager)
-                );
-
-        var timerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var timer = new Timer(
-            _ =>
-            {
-                _log.LogDebug(
-                    "file: {File}, progress: {Progress:0.00}%, dl: {DL}/s, ul: {UL}/s, peers: {Peers}, seeds: {Seeds}, leechers: {Leechs}, bytes: {Bytes}",
-                    selected.Path,
-                    manager.Progress,
-                    manager.Monitor.DownloadRate,
-                    manager.Monitor.UploadRate,
-                    manager.Peers.Available,
-                    manager.Peers.Seeds,
-                    manager.Peers.Leechs,
-                    manager.Monitor.DataBytesReceived
-                );
-            },
-            null,
-            TimeSpan.Zero,
-            TimeSpan.FromSeconds(10)
-        );
-
-        _log.LogInformation("starting torrent stream for {FilePath}", selected.Path);
-
-        Stream stream;
         try
         {
-            stream = await manager.StreamProvider.CreateStreamAsync(selected, ct);
+            manager = await engine.AddStreamingAsync(magnet, _downloadPath);
+            await manager.StartAsync();
+
+            if (!manager.HasMetadata)
+            {
+                while (!manager.HasMetadata && !ct.IsCancellationRequested)
+                    await Task.Delay(100, ct);
+
+                if (!manager.HasMetadata)
+                {
+                    await CleanupAsync();
+                    return StatusCode(503, "Metadata not yet available.");
+                }
+            }
+
+            var mgr = manager;
+            var selected =
+                idx is { } i and >= 0 && i < mgr.Files.Count
+                    ? mgr.Files[i]
+                    : (
+                        !string.IsNullOrWhiteSpace(filename)
+                            ? mgr.Files.FirstOrDefault(x =>
+                                x.Path.EndsWith(filename, StringComparison.OrdinalIgnoreCase)
+                                || string.Equals(
+                                    Path.GetFileName(x.Path),
+                                    filename,
+                                    StringComparison.OrdinalIgnoreCase
+                                )
+                            ) ?? PickHeuristic(mgr)
+                            : PickHeuristic(mgr)
+                    );
+
+            timerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timer = new Timer(
+                _ =>
+                {
+                    _log.LogDebug(
+                        "file: {File}, progress: {Progress:0.00}%, dl: {DL}/s, ul: {UL}/s, peers: {Peers}, seeds: {Seeds}, leechers: {Leechs}, bytes: {Bytes}",
+                        selected.Path,
+                        mgr.Progress,
+                        mgr.Monitor.DownloadRate,
+                        mgr.Monitor.UploadRate,
+                        mgr.Peers.Available,
+                        mgr.Peers.Seeds,
+                        mgr.Peers.Leechs,
+                        mgr.Monitor.DataBytesReceived
+                    );
+                },
+                null,
+                TimeSpan.Zero,
+                TimeSpan.FromSeconds(10)
+            );
+
+            _log.LogInformation("starting torrent stream for {FilePath}", selected.Path);
+
+            var stream = await mgr.StreamProvider.CreateStreamAsync(selected, ct);
+
+            Response.Headers.AcceptRanges = "bytes";
+            var result = File(stream, GuessContentType(selected.Path), enableRangeProcessing: true);
+
+            // Register cleanup for client disconnect / playback end. Don't block the
+            // cancellation callback on the async engine shutdown.
+            ct.Register(() =>
+            {
+                _log.LogInformation("Client disconnected. Cleaning up resources...");
+                _ = Task.Run(CleanupAsync);
+            });
+
+            return result;
         }
         catch
         {
-            timer.Dispose();
-            timerCts.Dispose();
-            try { await manager.StopAsync(); } catch { /* ignored */ }
-            engine.Dispose();
+            await CleanupAsync();
             throw;
         }
-
-        // Register cleanup for both normal completion and cancellation
-        ct.Register(() =>
-        {
-            _log.LogInformation("Client disconnected. Cleaning up resources...");
-            try
-            {
-                timerCts.Cancel();
-            }
-            catch
-            {
-                // ignored
-            }
-
-            try
-            {
-                timer.Dispose();
-            }
-            catch
-            {
-                // ignored
-            }
-
-            try
-            {
-                manager.StopAsync().GetAwaiter().GetResult();
-            }
-            catch
-            {
-                // ignored
-            }
-
-            try
-            {
-                engine.Dispose();
-            }
-            catch
-            {
-                // ignored
-            }
-        });
-
-        Response.Headers.AcceptRanges = "bytes";
-        return File(stream, GuessContentType(selected.Path), enableRangeProcessing: true);
     }
 
     private static ITorrentManagerFile PickHeuristic(TorrentManager manager)

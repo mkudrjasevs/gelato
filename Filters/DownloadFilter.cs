@@ -58,19 +58,28 @@ public sealed class DownloadFilter(
                     path = sources[0].Path;
                 }
 
+                // Placeholder sources carry a null path (no streams synced yet);
+                // passing that to HttpClient throws instead of falling through.
+                if (string.IsNullOrEmpty(path))
+                {
+                    await next();
+                    return;
+                }
+
+                var ct = ctx.HttpContext.RequestAborted;
                 var client = httpClientFactory.CreateClient();
 
                 var resp = await client.GetAsync(
                     path,
                     HttpCompletionOption.ResponseHeadersRead,
-                    CancellationToken.None
+                    ct
                 );
-
-                resp.EnsureSuccessStatusCode();
 
                 ctx.HttpContext.Response.RegisterForDispose(resp);
 
-                var stream = await resp.Content.ReadAsStreamAsync(CancellationToken.None);
+                resp.EnsureSuccessStatusCode();
+
+                var stream = await resp.Content.ReadAsStreamAsync(ct);
 
                 var contentType =
                     resp.Content.Headers.ContentType?.ToString() ?? "application/octet-stream";

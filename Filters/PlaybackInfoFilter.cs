@@ -16,6 +16,13 @@ public sealed class PlaybackInfoFilter : IAsyncActionFilter, IOrderedFilter
     private const string ItemsKey = "MediaSourceId";
     private static readonly string[] InputKeys = ["MediaSourceId", "RouteMediaSourceId"];
 
+    // Property lookups per argument type, so reflection runs once per type instead of
+    // on every request.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<
+        Type,
+        PropertyInfo?[]
+    > PropertyCache = new();
+
     public async Task OnActionExecutionAsync(
         ActionExecutingContext ctx,
         ActionExecutionDelegate next
@@ -70,13 +77,21 @@ public sealed class PlaybackInfoFilter : IAsyncActionFilter, IOrderedFilter
             if (v is null)
                 continue;
 
-            var type = v.GetType();
-            foreach (var key in InputKeys)
+            var props = PropertyCache.GetOrAdd(
+                v.GetType(),
+                static type =>
+                    InputKeys
+                        .Select(key =>
+                            type.GetProperty(
+                                key,
+                                BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase
+                            )
+                        )
+                        .ToArray()
+            );
+
+            foreach (var prop in props)
             {
-                var prop = type.GetProperty(
-                    key,
-                    BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase
-                );
                 if (prop?.GetValue(v) is string s && !string.IsNullOrWhiteSpace(s))
                 {
                     id = s;

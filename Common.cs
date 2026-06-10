@@ -543,22 +543,42 @@ public static class BaseItemExtensions
 
     public static void SetGelatoData<T>(this BaseItem item, string key, T value)
     {
-        Dictionary<string, JsonElement> data;
+        var data = LoadGelatoData(item);
+        data[key] = JsonSerializer.SerializeToElement(value);
+        item.ExternalId = JsonSerializer.Serialize(data);
+    }
 
+    /// <summary>
+    /// Sets multiple keys with a single deserialize/serialize round-trip of the
+    /// ExternalId JSON blob (the per-key overload re-parses the whole blob each call).
+    /// </summary>
+    public static void SetGelatoData(
+        this BaseItem item,
+        IEnumerable<KeyValuePair<string, object?>> values
+    )
+    {
+        var data = LoadGelatoData(item);
+        foreach (var (key, value) in values)
+        {
+            data[key] = JsonSerializer.SerializeToElement(value);
+        }
+
+        item.ExternalId = JsonSerializer.Serialize(data);
+    }
+
+    private static Dictionary<string, JsonElement> LoadGelatoData(BaseItem item)
+    {
         try
         {
-            data = string.IsNullOrEmpty(item.ExternalId)
+            return string.IsNullOrEmpty(item.ExternalId)
                 ? new Dictionary<string, JsonElement>()
                 : JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(item.ExternalId)
                     ?? new Dictionary<string, JsonElement>();
         }
         catch
         {
-            data = new Dictionary<string, JsonElement>();
+            return new Dictionary<string, JsonElement>();
         }
-
-        data[key] = JsonSerializer.SerializeToElement(value);
-        item.ExternalId = JsonSerializer.Serialize(data);
     }
 }
 
